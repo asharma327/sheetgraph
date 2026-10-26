@@ -1,0 +1,5 @@
+/target
+/sheetgraph-out
+# credentials: never commit service-account keys
+*.json
+!Cargo.lock

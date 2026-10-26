@@ -1,0 +1,15 @@
+[package]
+name = "sheetgraph"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+calamine = "0.37.0"
+clap = { version = "4.6.7", features = ["derive"] }
+csv = "1.4.0"
+flate2 = "1.1.10"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

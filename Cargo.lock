@@ -1166,9 +1166,11 @@ dependencies = [
  "csv",
  "flate2",
  "jsonwebtoken",
+ "quick-xml",
  "reqwest",
  "serde",
  "serde_json",
+ "zip",
 ]
 
 [[package]]

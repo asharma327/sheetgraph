@@ -95,6 +95,12 @@ pub fn analyze(wb: &Workbook) -> Analysis {
             named.insert(nr.name.to_ascii_uppercase(), (si, rect));
         }
     }
+    // Excel tables resolve like names: `Sales[Amount]` lexes as the name `Sales`.
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        for t in &sh.tables {
+            named.entry(t.name.to_ascii_uppercase()).or_insert((Some(si), t.range));
+        }
+    }
     let mut a = Analysis {
         sheets: Vec::new(),
         sheet_edges: BTreeMap::new(),
@@ -123,11 +129,10 @@ pub fn fingerprint(sh: &Sheet, sa: &SheetAnalysis) -> std::collections::HashSet<
         }
     }
     for c in &sh.cells {
-        if let (Value::Str(t), None) = (&c.v, &c.f) {
-            if c.r < 4 || c.c < 2 {
+        if let (Value::Str(t), None) = (&c.v, &c.f)
+            && (c.r < 4 || c.c < 2) {
                 fp.insert(format!("t:{}:{}", c.c, t.trim()));
             }
-        }
     }
     fp
 }
@@ -214,6 +219,10 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
         }
     }
     sa.used = used;
+    if let Some(e) = &sh.elided {
+        sa.n_cells += e.cells;
+        sa.n_formulas += e.formulas;
+    }
 
     // Vertical runs per column, then merge runs horizontally into rectangles.
     fcells.sort_unstable();
@@ -281,6 +290,7 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
             g.spill |= formula::SPILL_FUNCS.contains(&fu.as_str());
             g.external |= formula::EXTERNAL_FUNCS.contains(&fu.as_str());
         }
+        g.external |= !lx.books.is_empty();
         g.errors = cells_in(sh, &rect).filter(|c| matches!(c.v, Value::Err { .. })).count() as u32;
         g.refs = resolve_refs(wb, si, &lx, &rect, a);
         let mut targets: Vec<usize> = g.refs.iter().filter_map(|r| r.sheet).filter(|t| *t != si).collect();
@@ -292,7 +302,8 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
             e.1 += g.cells as u64;
         }
         for r in &g.refs {
-            if r.sheet.is_some() {
+            // `[Book.xlsx]Sheet` lives in another workbook: an external, not a broken ref.
+            if r.sheet.is_some() || r.sheet_name.as_deref().is_some_and(|n| n.starts_with('[')) {
                 continue;
             } else if let Some(n) = &r.sheet_name {
                 *a.broken_refs.entry(n.clone()).or_default() += g.cells as u64;
@@ -340,11 +351,10 @@ fn collect_externals(sh: &Sheet, si: usize, gi: usize, f: &str, lx: &Lexed, rect
         if let Some(s) = unquote(arg) {
             return s;
         }
-        if let Some((None, r)) = parse_ref(arg) {
-            if let Some(c) = find_cell(sh, r.r0, r.c0) {
+        if let Some((None, r)) = parse_ref(arg)
+            && let Some(c) = find_cell(sh, r.r0, r.c0) {
                 return c.display();
             }
-        }
         arg.to_string()
     };
     for fu in &lx.funcs {
@@ -358,17 +368,39 @@ fn collect_externals(sh: &Sheet, si: usize, gi: usize, f: &str, lx: &Lexed, rect
             "IMPORTHTML" | "IMPORTXML" => (target, args.get(1).map(|s| resolve(s))),
             _ => (target, None),
         };
-        // One entry per distinct (func, target, range) per group.
-        if !a.externals.iter().any(|e| e.sheet == si && e.group == gi && e.func == fu.name && e.target == target && e.range == range) {
-            a.externals.push(External { sheet: si, group: gi, func: fu.name.clone(), target, range });
+        push_external(a, External { sheet: si, group: gi, func: fu.name.clone(), target, range });
+    }
+    // Excel links: `'[Budget.xlsx]Data'!B2`, or `'[Budget.xlsx]'!Name` (no ref).
+    for book in &lx.books {
+        let prefix = format!("[{book}]");
+        let mut any = false;
+        for t in lx.refs.iter().filter(|t| t.sheet.as_deref().is_some_and(|s| s.starts_with(&prefix))) {
+            let sheet = &t.sheet.as_deref().unwrap_or_default()[prefix.len()..];
+            let r = t.rect().map(|r| r.a1()).unwrap_or_default();
+            push_external(a, External { sheet: si, group: gi, func: "workbook link".into(), target: book.clone(), range: Some(format!("{}!{r}", crate::a1::quote_sheet(sheet))) });
+            any = true;
+        }
+        if !any {
+            push_external(a, External { sheet: si, group: gi, func: "workbook link".into(), target: book.clone(), range: None });
         }
     }
     let _ = rect;
 }
 
+/// One entry per distinct (func, target, range) per group.
+fn push_external(a: &mut Analysis, e: External) {
+    if !a.externals.iter().any(|x| x.sheet == e.sheet && x.group == e.group && x.func == e.func && x.target == e.target && x.range == e.range) {
+        a.externals.push(e);
+    }
+}
+
 /// Connected regions of non-empty cells. Cells join when horizontally within
 /// one blank column of each other, or vertically adjacent with overlapping spans.
+/// Summarized rows ([`crate::model::Elided`]) don't separate the rows around
+/// them, and their cells count toward the block that spans them.
 fn find_blocks(sh: &Sheet) -> Vec<Block> {
+    let gap = sh.elided.as_ref().map(|e| e.rows);
+    let adjacent = |a: u32, b: u32| a + 1 == b || gap.is_some_and(|(g0, g1)| a < b && a + 1 >= g0 && b <= g1 + 1);
     // Row segments.
     let mut segs: Vec<(u32, u32, u32)> = Vec::new(); // (r, c0, c1)
     for cell in sh.cells.iter().filter(|c| !c.is_blank()) {
@@ -393,7 +425,7 @@ fn find_blocks(sh: &Sheet) -> Vec<Block> {
         while j < segs.len() && segs[j].0 == r {
             j += 1;
         }
-        if prev.1 > prev.0 && segs[prev.0].0 + 1 == r {
+        if prev.1 > prev.0 && adjacent(segs[prev.0].0, r) {
             let (mut p, mut q) = (prev.0, i);
             while p < prev.1 && q < j {
                 let (a, b) = (segs[p], segs[q]);
@@ -440,13 +472,19 @@ fn find_blocks(sh: &Sheet) -> Vec<Block> {
     boxes
         .into_iter()
         .map(|rect| {
-            let (mut cells, mut formulas) = (0, 0);
+            let (mut cells, mut formulas) = (0u32, 0u32);
             for c in cells_in(sh, &rect) {
                 if !c.is_blank() {
                     cells += 1;
                     if c.f.is_some() {
                         formulas += 1;
                     }
+                }
+            }
+            if let Some(e) = sh.elided.as_ref().filter(|e| rect.r0 < e.rows.0 && rect.r1 > e.rows.1) {
+                for st in e.cols.iter().filter(|st| (rect.c0..=rect.c1).contains(&st.col)) {
+                    cells = cells.saturating_add(st.filled.min(u32::MAX as u64) as u32);
+                    formulas = formulas.saturating_add(st.formulas.min(u32::MAX as u64) as u32);
                 }
             }
             Block { rect, cells, formulas }

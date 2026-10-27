@@ -1,0 +1,35 @@
+name: Bug report
+description: Something was extracted wrong, missing, or failed.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't attach real spreadsheets with confidential data**, or their REPORT.md / workbook.json.gz, which contain the same values. A small copy with made-up data that shows the problem is best.
+        Security problems go through the Security tab instead (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got (paste the relevant output or report lines).
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Source
+      options: [Google Sheets, xlsx, xlsm, xls, xlsb, ods, csv]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version and OS
+      placeholder: sheetgraph 0.1.0, macOS 15
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Sample file
+      description: Attach a made-up file that reproduces it, or describe how to build one.

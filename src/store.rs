@@ -64,7 +64,12 @@ pub fn save(out: &Path, wb: &Workbook, a: &Analysis, report: &str) -> Result<(Pa
     fs::create_dir_all(&dir)?;
     let f = fs::File::create(dir.join("workbook.json.gz"))?;
     let mut gz = flate2::write::GzEncoder::new(BufWriter::new(f), flate2::Compression::fast());
-    serde_json::to_writer(&mut gz, wb)?;
+    // Buffer in front of the encoder too: serde_json writes in tiny pieces,
+    // which are slow to compress one at a time.
+    let mut w = BufWriter::with_capacity(1 << 16, &mut gz);
+    serde_json::to_writer(&mut w, wb)?;
+    w.flush()?;
+    drop(w);
     gz.finish()?.flush()?;
     save_derived(&dir, wb, a, report)
 }
@@ -75,7 +80,8 @@ pub fn save_derived(dir: &Path, wb: &Workbook, a: &Analysis, report: &str) -> Re
     fs::write(dir.join("REPORT.md"), report)?;
     let g = crate::graph::build(wb, a);
     fs::write(dir.join("graph.json"), serde_json::to_vec(&g)?)?;
-    let mut imports: Vec<String> = a.externals.iter().filter(|e| e.func == "IMPORTRANGE").map(|e| e.target.clone()).collect();
+    let mut imports: Vec<String> =
+        a.externals.iter().filter(|e| e.func == "IMPORTRANGE" || e.func == "workbook link").map(|e| e.target.clone()).collect();
     imports.sort();
     imports.dedup();
     let meta = Meta {
@@ -103,7 +109,6 @@ pub fn load(path: &Path) -> Result<Workbook> {
     let f = fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
     let gz = flate2::read::GzDecoder::new(BufReader::new(f));
     let mut wb: Workbook = serde_json::from_reader(BufReader::new(gz))?;
-    // Snapshots written before canonical ordering existed get normalized here.
     crate::model::canonicalize(&mut wb);
     Ok(wb)
 }
@@ -113,11 +118,10 @@ pub fn write_index(out: &Path) -> Result<String> {
     let mut metas: Vec<Meta> = Vec::new();
     for e in fs::read_dir(out)? {
         let p = e?.path().join("meta.json");
-        if let Ok(b) = fs::read(&p) {
-            if let Ok(m) = serde_json::from_slice::<Meta>(&b) {
+        if let Ok(b) = fs::read(&p)
+            && let Ok(m) = serde_json::from_slice::<Meta>(&b) {
                 metas.push(m);
             }
-        }
     }
     metas.sort_by(|a, b| a.title.cmp(&b.title));
     let mut s = String::from("# Spreadsheet index\n");
@@ -141,12 +145,18 @@ pub fn write_index(out: &Path) -> Result<String> {
     let mut links = Vec::new();
     for m in &metas {
         for t in &m.imports {
-            let target = metas.iter().find(|x| &x.id == t).map(|x| format!("**{}**", x.title)).unwrap_or_else(|| format!("`{t}` (not extracted)"));
+            // Sheets ids match exactly; Excel links name the other file.
+            let same_file = |x: &Meta| Path::new(&x.id).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(t));
+            let target = metas
+                .iter()
+                .find(|x| &x.id == t || same_file(x))
+                .map(|x| format!("**{}**", x.title))
+                .unwrap_or_else(|| format!("`{t}` (not extracted)"));
             links.push(format!("- **{}** imports from {}", m.title, target));
         }
     }
     if !links.is_empty() {
-        s.push_str("\n## Cross-workbook links (IMPORTRANGE; ranges are listed in each REPORT.md under External links)\n");
+        s.push_str("\n## Cross-workbook links (IMPORTRANGE and Excel external links; ranges are listed in each REPORT.md under External links)\n");
         s.push_str(&links.join("\n"));
         s.push('\n');
     }

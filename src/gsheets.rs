@@ -35,15 +35,19 @@ impl Auth {
     /// gcloud application-default credentials.
     pub fn discover(path: Option<&str>) -> Result<Auth> {
         let http = reqwest::blocking::Client::builder().timeout(Duration::from_secs(300)).build()?;
-        if path.is_none() {
-            if let Ok(t) = std::env::var("SHEETGRAPH_TOKEN") {
+        if path.is_none()
+            && let Ok(t) = std::env::var("SHEETGRAPH_TOKEN") {
                 return Ok(Auth { http, cred: Cred::Static(t), cached: Mutex::new(None) });
             }
-        }
         let p = match path {
             Some(p) => p.to_string(),
             None => match std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
                 Ok(p) => p,
+                // Where `gcloud auth application-default login` writes them.
+                Err(_) if cfg!(windows) => {
+                    let appdata = std::env::var("APPDATA").unwrap_or_default();
+                    format!("{appdata}\\gcloud\\application_default_credentials.json")
+                }
                 Err(_) => {
                     let home = std::env::var("HOME").unwrap_or_default();
                     format!("{home}/.config/gcloud/application_default_credentials.json")
@@ -74,11 +78,10 @@ impl Auth {
 
     pub fn token(&self) -> Result<String> {
         let mut c = self.cached.lock().unwrap();
-        if let Some((t, exp)) = c.as_ref() {
-            if Instant::now() < *exp {
+        if let Some((t, exp)) = c.as_ref()
+            && Instant::now() < *exp {
                 return Ok(t.clone());
             }
-        }
         let resp: J = match &self.cred {
             Cred::Static(t) => return Ok(t.clone()),
             Cred::ServiceAccount { email, key_pem } => {
@@ -227,14 +230,16 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
         sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata)";
     let meta: J = serde_json::from_str(&auth.get(&format!("{SHEETS}/{id}"), &[("fields", meta_fields)])?)?;
 
-    let mut wb = Workbook::default();
-    wb.source = Source {
-        kind: "gsheet".into(),
-        id: id.clone(),
-        title: meta["properties"]["title"].as_str().unwrap_or_default().into(),
-        locale: meta["properties"]["locale"].as_str().map(Into::into),
-        time_zone: meta["properties"]["timeZone"].as_str().map(Into::into),
-        url: meta["spreadsheetUrl"].as_str().map(Into::into),
+    let mut wb = Workbook {
+        source: Source {
+            kind: "gsheet".into(),
+            id: id.clone(),
+            title: meta["properties"]["title"].as_str().unwrap_or_default().into(),
+            locale: meta["properties"]["locale"].as_str().map(Into::into),
+            time_zone: meta["properties"]["timeZone"].as_str().map(Into::into),
+            url: meta["spreadsheetUrl"].as_str().map(Into::into),
+            ..Default::default()
+        },
         ..Default::default()
     };
     // Drive metadata is best-effort: needs the drive scope and visibility.
@@ -471,12 +476,11 @@ fn merge_spans(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 }
 
 fn push_span(spans: &mut Vec<(u32, u32)>, i: u32) {
-    if let Some(last) = spans.last_mut() {
-        if last.1 + 1 == i {
+    if let Some(last) = spans.last_mut()
+        && last.1 + 1 == i {
             last.1 = i;
             return;
         }
-    }
     spans.push((i, i));
 }
 

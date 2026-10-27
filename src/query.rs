@@ -75,6 +75,9 @@ pub fn cells(wb: &Workbook, a: &Analysis, range: &str, limit: usize) -> Result<S
         let _ = writeln!(s, "{}", describe_cell(wb, a, si, c));
         n += 1;
     }
+    if let Some(e) = sh.elided.as_ref().filter(|e| rect.r0 <= e.rows.1 && e.rows.0 <= rect.r1) {
+        let _ = writeln!(s, "rows {}–{} are summarized, not kept: their cells aren't listed (REPORT.md has their column totals)", e.rows.0 + 1, e.rows.1 + 1);
+    }
     Ok(s)
 }
 
@@ -127,6 +130,7 @@ pub fn trace(wb: &Workbook, a: &Analysis, cell: &str, depth: usize, up: bool, do
     Ok(s)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn precedents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max: usize, seen: &mut HashSet<(usize, Rect)>, out: &mut String) {
     if d > max {
         return;
@@ -156,6 +160,13 @@ fn precedents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max
         }
         for t in &lx.refs {
             let Some(r) = t.rect() else { continue };
+            if let Some(n) = t.sheet.as_deref().filter(|n| n.starts_with('[')) {
+                let e = format!("'{n}'!{r}");
+                if !externals.contains(&e) {
+                    externals.push(e);
+                }
+                continue;
+            }
             let ts = match &t.sheet {
                 None => Some(si),
                 Some(n) => sheet_index(wb, n),
@@ -198,6 +209,7 @@ fn merge_ref(refs: &mut Vec<(usize, Rect)>, ts: usize, r: Rect) {
     refs.push((ts, r));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dependents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max: usize, seen: &mut HashSet<(usize, Rect)>, out: &mut String) {
     if d > max {
         return;
@@ -246,11 +258,10 @@ fn dependents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max
     for (cs, sh) in wb.sheets.iter().enumerate() {
         for ch in &sh.charts {
             for src in &ch.sources {
-                if let Some((Some(n), r)) = parse_ref(src) {
-                    if sheet_index(wb, &n) == Some(si) && r.intersects(rect) {
+                if let Some((Some(n), r)) = parse_ref(src)
+                    && sheet_index(wb, &n) == Some(si) && r.intersects(rect) {
                         let _ = writeln!(out, "{}→ chart \"{}\" on {}", "  ".repeat(d), ch.title, wb.sheets[cs].name);
                     }
-                }
             }
         }
     }
@@ -275,7 +286,26 @@ pub fn find(wb: &Workbook, a: &Analysis, needle: &str, limit: usize) -> String {
     if hits > limit {
         let _ = writeln!(s, "… {} hits total (raise --limit)", hits);
     }
-    if hits == 0 {
+    // Summarized rows only have their texts tallied per column; count matches there.
+    let mut summarized = 0;
+    for sh in &wb.sheets {
+        let Some(e) = &sh.elided else { continue };
+        let mut cols = Vec::new();
+        for st in &e.cols {
+            let m: u64 = st.texts.iter().filter(|(t, _)| t.to_lowercase().contains(&n)).map(|(_, k)| k).sum();
+            if m > 0 {
+                summarized += m;
+                cols.push(format!("{} ({m})", crate::a1::col_name(st.col)));
+            }
+        }
+        let rows = format!("{}!{}:{} (summarized rows)", quote_sheet(&sh.name), e.rows.0 + 1, e.rows.1 + 1);
+        if cols.is_empty() {
+            let _ = writeln!(s, "{rows}: no tallied text matches; numbers, formulas and texts past each column's tally aren't searchable there");
+        } else {
+            let _ = writeln!(s, "{rows}: more text matches in column {}", cols.join(", "));
+        }
+    }
+    if hits == 0 && summarized == 0 {
         s.push_str("no matches\n");
     }
     s

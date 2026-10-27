@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "sheetgraph", about = "Extract spreadsheets into a compact LLM-readable map + formula graph")]
+#[command(name = "sheetgraph", version, about = "Extract spreadsheets into a compact LLM-readable map + formula graph")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -13,12 +13,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Extract Google Sheets (id or URL) and/or local files (xlsx, xlsm, xls, ods, csv).
+    /// Extract Google Sheets (id or URL) and/or local files (xlsx, xlsm, xls, xlsb, ods, csv).
     Extract {
         sources: Vec<String>,
         #[arg(short, long, default_value = "sheetgraph-out")]
         out: PathBuf,
-        /// Service-account or authorized-user JSON (default: $GOOGLE_APPLICATION_CREDENTIALS, then gcloud ADC).
+        /// Service-account or authorized-user JSON (default: $SHEETGRAPH_TOKEN, $GOOGLE_APPLICATION_CREDENTIALS, then gcloud ADC).
         #[arg(long)]
         creds: Option<String>,
         /// Apps Script project id(s) to include (needs user OAuth with script.projects.readonly).

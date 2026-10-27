@@ -20,6 +20,10 @@ pub struct Workbook {
     pub data_sources: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub developer_metadata: Vec<serde_json::Value>,
+    /// Other workbooks this one references (Excel external links). Formulas
+    /// name them as `'[file]Sheet'!A1`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_links: Vec<ExternalLink>,
     /// Anything the backend could not extract, so consumers know what is missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -82,6 +86,79 @@ pub struct Sheet {
     pub hidden_cols: Vec<(u32, u32)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banded: Vec<Rect>,
+    /// Excel tables (ListObjects); formulas reach them as `Name[Column]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<Table>,
+    /// Rows summarized instead of kept, when the workbook was too big to hold
+    /// whole (see [`crate::xlsx::CELL_BUDGET`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elided: Option<Elided>,
+}
+
+/// A run of rows whose cells are not in [`Sheet::cells`] (formulas excepted, up
+/// to a cap), with every column's values totalled instead.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Elided {
+    /// First and last summarized row, 0-based and inclusive.
+    pub rows: (u32, u32),
+    /// Non-empty cells in those rows that are not in `cells`.
+    pub cells: u64,
+    /// Of those, formula cells (only once the cap on kept formulas is reached).
+    pub formulas: u64,
+    pub cols: Vec<ColStats>,
+}
+
+/// Running totals for one column of summarized rows.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ColStats {
+    pub col: u32,
+    pub filled: u64,
+    pub formulas: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nums: Option<Span>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dates: Option<Span>,
+    /// Text values with how often each appears, most frequent first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<(String, u64)>,
+    pub text_cells: u64,
+    /// More distinct texts appeared than `texts` lists; their cells are still
+    /// counted in `text_cells`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub more_texts: bool,
+    pub bools: u64,
+    pub errors: u64,
+}
+
+/// Count and extremes of a column's numbers or dates, with how each extreme displays.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Span {
+    pub n: u64,
+    pub lo: f64,
+    pub lo_text: String,
+    pub hi: f64,
+    pub hi_text: String,
+}
+
+impl Span {
+    pub fn add(span: &mut Option<Span>, v: f64, text: impl FnOnce() -> String) {
+        match span {
+            None => {
+                let t = text();
+                *span = Some(Span { n: 1, lo: v, lo_text: t.clone(), hi: v, hi_text: t });
+            }
+            Some(s) => {
+                s.n += 1;
+                if v < s.lo {
+                    s.lo = v;
+                    s.lo_text = text();
+                } else if v > s.hi {
+                    s.hi = v;
+                    s.hi_text = text();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -265,6 +342,27 @@ pub struct Pivot {
     pub values: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Table {
+    pub name: String,
+    /// Whole table including the header (and totals) rows.
+    pub range: Rect,
+    pub columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub totals: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalLink {
+    /// File name as it appears in formulas, e.g. `Budget 2026.xlsx`.
+    pub name: String,
+    /// Link target as stored (path or URL).
+    pub target: String,
+    /// Sheet names cached from the other workbook.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sheets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

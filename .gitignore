@@ -1,5 +1,5 @@
 /target
 /sheetgraph-out
+.DS_Store
 # credentials: never commit service-account keys
 *.json
-!Cargo.lock

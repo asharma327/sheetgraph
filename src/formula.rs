@@ -27,6 +27,8 @@ pub struct Lexed {
     /// Bare identifiers that are not functions or refs: named ranges, LET/LAMBDA
     /// params, Excel table names.
     pub names: Vec<String>,
+    /// Other workbooks referenced as `'[Budget.xlsx]Sheet'!A1` (Excel links).
+    pub books: Vec<String>,
 }
 
 fn is_ident(b: u8) -> bool {
@@ -77,6 +79,10 @@ pub fn lex(f: &str) -> Lexed {
                 i += 1;
                 if i < b.len() && b[i] == b'!' {
                     let sheet = String::from_utf8_lossy(&name).into_owned();
+                    if let Some((book, _)) = sheet.strip_prefix('[').and_then(|s| s.split_once(']'))
+                        && !out.books.iter().any(|x| x == book) {
+                            out.books.push(book.to_string());
+                        }
                     i = lex_ref_after_sheet(f, start, i + 1, Some(sheet), &mut out);
                 }
             }
@@ -133,13 +139,12 @@ pub fn lex(f: &str) -> Lexed {
                         while k < b.len() && is_refch(b[k]) {
                             k += 1;
                         }
-                        if let Some(bp) = parse_pt(&f[s2..k]) {
-                            if pts_rect(a, Some(bp)).is_some() {
+                        if let Some(bp) = parse_pt(&f[s2..k])
+                            && pts_rect(a, Some(bp)).is_some() {
                                 out.refs.push(RefTok { span: (start, k), sheet: None, a, b: Some(bp) });
                                 i = k;
                                 continue;
                             }
-                        }
                     }
                     if a.col.is_some() && a.row.is_some() {
                         out.refs.push(RefTok { span: (start, i), sheet: None, a, b: None });
@@ -179,12 +184,11 @@ fn lex_ref_after_sheet(f: &str, start: usize, mut i: usize, sheet: Option<String
         while k < b.len() && is_refch(b[k]) {
             k += 1;
         }
-        if let Some(bp) = parse_pt(&f[s2..k]) {
-            if pts_rect(a, Some(bp)).is_some() {
+        if let Some(bp) = parse_pt(&f[s2..k])
+            && pts_rect(a, Some(bp)).is_some() {
                 out.refs.push(RefTok { span: (start, k), sheet, a, b: Some(bp) });
                 return k;
             }
-        }
     }
     if a.col.is_some() && a.row.is_some() {
         out.refs.push(RefTok { span: (start, i), sheet, a, b: None });
@@ -429,6 +433,13 @@ mod tests {
         assert_eq!(lx.names, vec!["Rate"]);
         let args = call_args(f, lx.funcs[1].open);
         assert_eq!(args, vec!["\"abc\"", "\"S!A1:B2\""]);
+    }
+
+    #[test]
+    fn external_workbook_refs() {
+        let lx = lex("='[Budget 2026.xlsx]Data'!B2+'[Rates.xlsx]'!Margin*C1");
+        assert_eq!(lx.books, vec!["Budget 2026.xlsx", "Rates.xlsx"]);
+        assert_eq!(lx.refs[0].sheet.as_deref(), Some("[Budget 2026.xlsx]Data"));
     }
 
     #[test]

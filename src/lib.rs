@@ -11,6 +11,7 @@ pub mod formula;
 pub mod graph;
 pub mod gsheets;
 pub mod model;
+pub mod ooxml;
 pub mod query;
 pub mod report;
 pub mod store;

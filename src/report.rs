@@ -1,9 +1,9 @@
 //! Compact text rendering for LLM consumption. Everything here is a summary;
-//! exact cells come from `query` against workbook.json.
+//! exact cells come from `query` against workbook.json.gz.
 
 use crate::a1::{col_name, Rect};
 use crate::analyze::{cells_in, cover, find_cell, fingerprint, Analysis, Group, SheetAnalysis};
-use crate::model::{Cell, Sheet, Style, Validation, Value, Workbook};
+use crate::model::{Cell, ColStats, Sheet, Span, Style, Validation, Value, Workbook};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
@@ -182,8 +182,12 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         }
     }
 
-    if !a.externals.is_empty() || !a.broken_refs.is_empty() || !wb.data_sources.is_empty() {
+    if !a.externals.is_empty() || !a.broken_refs.is_empty() || !wb.data_sources.is_empty() || !wb.external_links.is_empty() {
         let _ = writeln!(s, "\n## External links");
+        for l in &wb.external_links {
+            let sheets = if l.sheets.is_empty() { String::new() } else { format!(" · sheets: {}", trunc(&l.sheets.join(", "), 120)) };
+            let _ = writeln!(s, "linked workbook [{}] = {}{sheets}", l.name, trunc(&l.target, 160));
+        }
         // One line per (function, target): the imported ranges and where they land.
         let mut by_target: Vec<((String, String), Vec<String>)> = Vec::new();
         for e in &a.externals {
@@ -312,6 +316,15 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
         let _ = write!(head, " · tab {t}");
     }
     let _ = writeln!(s, "{head}");
+    if let Some(e) = &sh.elided {
+        let _ = writeln!(
+            s,
+            "⋯ rows {}–{} summarized, not kept ({} cells; the sheet is too big to hold whole): column profiles below count them, sample rows and `cells`/`find` don't",
+            e.rows.0 + 1,
+            e.rows.1 + 1,
+            k(e.cells)
+        );
+    }
     if sa.used.is_none() && sh.charts.is_empty() {
         return s;
     }
@@ -352,6 +365,16 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
         let rest: Vec<Rect> = order.iter().skip(o.max_blocks).map(|&i| sa.blocks[i].rect).collect();
         let cells: u32 = order.iter().skip(o.max_blocks).map(|&i| sa.blocks[i].cells).sum();
         let _ = writeln!(s, "▸ +{} smaller blocks ({} cells): {}", rest.len(), cells, rect_list(&rest, 8));
+    }
+    // Summarized rows no block spans: profile them on their own.
+    if let Some(e) = &sh.elided
+        && !sa.blocks.iter().any(|b| b.rect.r0 < e.rows.0 && b.rect.r1 > e.rows.1)
+    {
+        let _ = writeln!(s, "▸ rows {}–{} (summarized, {} cells)", e.rows.0 + 1, e.rows.1 + 1, e.cells);
+        for st in e.cols.iter().take(o.max_profile_lines) {
+            let (_, prof) = profile(wb, &[], &group_at, Some(st));
+            let _ = writeln!(s, "  {} -: {prof}", col_name(st.col));
+        }
     }
 
     // ---- formulas
@@ -467,6 +490,9 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
     }
     if !sh.banded.is_empty() {
         misc.push(format!("banded: {}", rect_list(&sh.banded, 4)));
+    }
+    for t in &sh.tables {
+        misc.push(format!("table {} {} [{}]{}", t.name, t.range, trunc(&t.columns.join(", "), 200), if t.totals { " +totals row" } else { "" }));
     }
     for ch in &sh.charts {
         misc.push(format!("chart {} \"{}\" ← {}", ch.kind, trunc(&ch.title, 50), ch.sources.join(", ")));
@@ -733,11 +759,10 @@ fn dump_block(s: &mut String, sh: &Sheet, rect: &Rect, group_at: &dyn Fn(u32, u3
         }
         let line = &mut rows.last_mut().unwrap().1;
         let _ = write!(line, " {}=", col_name(c.c));
-        if c.f.is_some() {
-            if let Some(g) = group_at(c.r, c.c) {
+        if c.f.is_some()
+            && let Some(g) = group_at(c.r, c.c) {
                 let _ = write!(line, "ƒ{}→", g + 1);
             }
-        }
         line.push_str(&cell_text(c, o.cell_width));
     }
     let mut i = 0;
@@ -764,6 +789,10 @@ enum Orient {
 fn is_text(c: &Cell) -> bool {
     matches!(c.v, Value::Str(_)) && c.f.is_none()
 }
+
+/// One profiled column (or row) of a block: index label, header text, header
+/// is text, data cells, totals from summarized rows.
+type Line<'a> = (String, String, bool, Vec<&'a Cell>, Option<&'a ColStats>);
 
 /// Large blocks: detect header + orientation, profile each column (or row).
 fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells: u32, group_at: &dyn Fn(u32, u32) -> Option<usize>, o: &Opts) {
@@ -824,8 +853,10 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
 
     // Build lines: (index label, header text, data cells)
     let data_start = header_row.map(|h| h + 1).unwrap_or(rect.r0);
-    // (index label, header text, header is text, data cells)
-    let mut lines: Vec<(String, String, bool, Vec<&Cell>)> = Vec::new();
+    // Totals for the column's summarized rows, when this block spans them.
+    let elided = sh.elided.as_ref().filter(|e| rect.r0 < e.rows.0 && rect.r1 > e.rows.1);
+    let summed = |c: u32| elided.and_then(|e| e.cols.iter().find(|st| st.col == c));
+    let mut lines: Vec<Line> = Vec::new();
     match orient {
         Orient::Cols => {
             // Labels above the header row (often merged across a column group,
@@ -856,10 +887,10 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
                     last_above = sup;
                 }
                 let data: Vec<&Cell> = (data_start..=rect.r1).filter_map(|r| at.get(&(r, c)).copied()).collect();
-                if data.is_empty() && head.is_empty() {
+                if data.is_empty() && head.is_empty() && summed(c).is_none() {
                     continue;
                 }
-                lines.push((col_name(c), head, hc.is_some_and(|x| is_text(x)), data));
+                lines.push((col_name(c), head, hc.is_some_and(|x| is_text(x)), data, summed(c)));
             }
         }
         Orient::Rows => {
@@ -871,7 +902,7 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
                 if data.is_empty() && head.is_empty() {
                     continue;
                 }
-                lines.push(((r + 1).to_string(), head, hc.is_some_and(|x| is_text(x)), data));
+                lines.push(((r + 1).to_string(), head, hc.is_some_and(|x| is_text(x)), data, None));
             }
         }
     }
@@ -879,8 +910,8 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
     // Profile + collapse runs of identical signature.
     let profiled: Vec<(String, String, bool, String, String)> = lines
         .iter()
-        .map(|(idx, head, texty, data)| {
-            let (sig, prof) = profile(wb, data, group_at);
+        .map(|(idx, head, texty, data, summed)| {
+            let (sig, prof) = profile(wb, data, group_at, *summed);
             (idx.clone(), head.clone(), *texty, sig, prof)
         })
         .collect();
@@ -930,11 +961,10 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
             v
         };
         let mut pick: Vec<u32> = rows_with_data.iter().take(o.sample_rows).copied().collect();
-        if let Some(&last) = rows_with_data.last() {
-            if !pick.contains(&last) {
+        if let Some(&last) = rows_with_data.last()
+            && !pick.contains(&last) {
                 pick.push(last);
             }
-        }
         let cols: Vec<u32> = (rect.c0..=rect.c1).take(o.sample_cols).collect();
         let _ = writeln!(s, "  sample ({}{}):", cols.iter().map(|c| col_name(*c)).collect::<Vec<_>>().first().cloned().unwrap_or_default(), if rect.cols() > o.sample_cols as u64 { format!("…{} of {}", col_name(rect.c0 + o.sample_cols as u32 - 1), rect.cols()) } else { format!("…{}", col_name(rect.c1)) });
         for r in pick {
@@ -944,26 +974,26 @@ fn profile_block(s: &mut String, wb: &Workbook, sh: &Sheet, rect: &Rect, ncells:
     }
 }
 
-/// Returns (signature for run-collapsing, human profile).
-fn profile(wb: &Workbook, data: &[&Cell], group_at: &dyn Fn(u32, u32) -> Option<usize>) -> (String, String) {
-    if data.is_empty() {
+/// Returns (signature for run-collapsing, human profile). `summed` adds the
+/// column's totals from summarized rows to what its kept cells show.
+fn profile<'a>(wb: &Workbook, data: &[&'a Cell], group_at: &dyn Fn(u32, u32) -> Option<usize>, summed: Option<&'a ColStats>) -> (String, String) {
+    if data.is_empty() && summed.is_none() {
         return ("empty".into(), "empty".into());
     }
-    let n = data.len();
+    let n = data.len() + summed.map_or(0, |st| st.filled as usize);
     let mut nums: Vec<&Cell> = Vec::new();
     let mut dates: Vec<&Cell> = Vec::new();
     let mut texts: Vec<&str> = Vec::new();
-    let (mut bools, mut errs, mut formulas) = (0, 0, 0);
+    let (mut bools, mut errs, mut formulas) = summed.map_or((0, 0, 0), |st| (st.bools as usize, st.errors as usize, st.formulas as usize));
     let mut groups: Vec<usize> = Vec::new();
     let mut fmts: HashMap<&str, usize> = HashMap::new();
     for c in data {
         if c.f.is_some() {
             formulas += 1;
-            if let Some(g) = group_at(c.r, c.c) {
-                if !groups.contains(&g) {
+            if let Some(g) = group_at(c.r, c.c)
+                && !groups.contains(&g) {
                     groups.push(g);
                 }
-            }
         }
         let st = c.s.map(|s| &wb.styles[s as usize]);
         if let Some(f) = st.and_then(|s| s.num_fmt.as_deref()) {
@@ -987,40 +1017,62 @@ fn profile(wb: &Workbook, data: &[&Cell], group_at: &dyn Fn(u32, u32) -> Option<
         // Family-level signature so neighbouring columns of the same computed shape collapse.
         sig.push_str(&groups.len().min(2).to_string());
     }
-    let span = |v: &Vec<&Cell>| -> String {
-        let mut v = v.clone();
-        v.sort_by(|a, b| num(a).partial_cmp(&num(b)).unwrap_or(std::cmp::Ordering::Equal));
-        let (lo, hi) = (v[0], v[v.len() - 1]);
-        if num(lo) == num(hi) { lo.display() } else { format!("{} … {}", lo.display(), hi.display()) }
+    // Lowest … highest, over the kept cells and the summarized rows' extremes.
+    let span = |v: &Vec<&Cell>, extra: Option<&Span>| -> String {
+        let mut ends: Option<(f64, String, f64, String)> = None;
+        if !v.is_empty() {
+            let mut v = v.clone();
+            v.sort_by(|a, b| num(a).partial_cmp(&num(b)).unwrap_or(std::cmp::Ordering::Equal));
+            let (lo, hi) = (v[0], v[v.len() - 1]);
+            ends = Some((num(lo), lo.display(), num(hi), hi.display()));
+        }
+        if let Some(x) = extra {
+            ends = Some(match ends {
+                None => (x.lo, x.lo_text.clone(), x.hi, x.hi_text.clone()),
+                Some((lo, lo_t, hi, hi_t)) => {
+                    let (lo, lo_t) = if x.lo < lo { (x.lo, x.lo_text.clone()) } else { (lo, lo_t) };
+                    let (hi, hi_t) = if x.hi > hi { (x.hi, x.hi_text.clone()) } else { (hi, hi_t) };
+                    (lo, lo_t, hi, hi_t)
+                }
+            });
+        }
+        let (lo, lo_t, hi, hi_t) = ends.unwrap_or_default();
+        if lo == hi { lo_t } else { format!("{lo_t} … {hi_t}") }
     };
-    if !dates.is_empty() {
-        parts.push(format!("date {}", span(&dates)));
+    let (sum_dates, sum_nums) = (summed.and_then(|st| st.dates.as_ref()), summed.and_then(|st| st.nums.as_ref()));
+    if !dates.is_empty() || sum_dates.is_some() {
+        parts.push(format!("date {}", span(&dates, sum_dates)));
         sig.push('d');
     }
-    if !nums.is_empty() {
-        let mut p = format!("num {}", span(&nums));
-        if let Some((f, _)) = fmts.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))) {
-            if dates.is_empty() {
+    if !nums.is_empty() || sum_nums.is_some() {
+        let mut p = format!("num {}", span(&nums, sum_nums));
+        if let Some((f, _)) = fmts.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+            && dates.is_empty() && sum_dates.is_none() {
                 let _ = write!(p, " fmt {f}");
             }
-        }
         parts.push(p);
         sig.push('n');
     }
-    if !texts.is_empty() {
+    let text_cells = texts.len() + summed.map_or(0, |st| st.text_cells as usize);
+    if text_cells > 0 {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for t in &texts {
             *counts.entry(t).or_default() += 1;
         }
+        for (t, k) in summed.iter().flat_map(|st| &st.texts) {
+            *counts.entry(t).or_default() += *k as usize;
+        }
+        // Summarized rows had more distinct texts than were tallied.
+        let more = summed.is_some_and(|st| st.more_texts);
         let mut v: Vec<_> = counts.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        if v.len() <= 8 && texts.len() >= v.len() * 2 && texts.len() > 3 {
+        if v.len() <= 8 && text_cells >= v.len() * 2 && text_cells > 3 && !more {
             parts.push(format!("enum {}", v.iter().map(|(t, c)| format!("{}({c})", trunc(t, 24))).collect::<Vec<_>>().join(" ")));
-        } else if v.len() == 1 {
+        } else if v.len() == 1 && !more {
             parts.push(format!("text \"{}\"", trunc(v[0].0, 30)));
         } else {
             let eg: Vec<String> = v.iter().take(3).map(|(t, _)| format!("\"{}\"", trunc(t, 24))).collect();
-            parts.push(format!("text {} distinct e.g. {}", v.len(), eg.join(", ")));
+            parts.push(format!("text {}{} distinct e.g. {}", if more { "over " } else { "" }, v.len(), eg.join(", ")));
         }
         sig.push('t');
     }
@@ -1048,7 +1100,7 @@ fn num(c: &Cell) -> f64 {
     }
 }
 
-fn looks_date(t: &str) -> bool {
+pub(crate) fn looks_date(t: &str) -> bool {
     let b = t.as_bytes();
     let seps = b.iter().filter(|c| **c == b'/' || **c == b'-').count();
     seps == 2 && b.iter().filter(|c| c.is_ascii_digit()).count() >= 4 && t.len() <= 20

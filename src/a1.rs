@@ -187,7 +187,7 @@ pub fn parse_pt(s: &str) -> Option<Pt> {
         return None;
     }
     if col.is_none() && col_abs {
-        // "$5" is a valid absolute row in a row range only when written "$5"; treat as row abs.
+        // "$5": the "$" makes the row absolute.
         return Some(Pt { col: None, row, col_abs: false, row_abs: true });
     }
     Some(Pt { col, row, col_abs, row_abs })

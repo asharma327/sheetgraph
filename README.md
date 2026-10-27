@@ -2,7 +2,7 @@
 
 > **Beta (0.1).** It works on real-world files, but the report format and the library API may still change between releases. Bug reports are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Extracts spreadsheets (Google Sheets, xlsx/xlsm/xls/xlsb/ods, csv) into a **compact map an LLM can read in one pass** plus a **formula dependency graph** — and keeps every cell on disk so an agent can drill down exactly when it needs to. Inspired by [graphify](https://github.com/Graphify-Labs/graphify) (overview report → scoped queries → full graph), but for spreadsheets.
+Extracts spreadsheets (Google Sheets, xlsx/xlsm/xls/xlsb/ods, csv) into a **compact map an LLM can read in one pass** plus a **formula dependency graph** — and saves the cells alongside it, so an agent can look up exact values when it needs to. Inspired by [graphify](https://github.com/Graphify-Labs/graphify) (overview report → scoped queries → full graph), but for spreadsheets.
 
 Workbooks up to **10 million cells** (Google Sheets' own limit) are kept whole. Bigger files still extract: the middle rows of their largest sheets are reduced to exact column totals (see [Known gaps](#known-gaps)).
 

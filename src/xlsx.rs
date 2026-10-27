@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, CellType, Data, Range, Reader, SheetVisible, Sheets, XlsxError};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// Cells a workbook keeps in full: about 2–3 GB of memory.
@@ -40,7 +40,7 @@ pub fn read_limited(path: &Path, budget: u64) -> Result<Workbook> {
     let mut left = budget;
     if ext == "csv" || ext == "tsv" {
         let mut keep = Keep::new(&mut left);
-        let (grid_rows, grid_cols) = read_csv(path, if ext == "tsv" { b'\t' } else { b',' }, &mut keep)?;
+        let (grid_rows, grid_cols) = read_csv(path, ext == "tsv", &mut keep)?;
         let (cells, elided) = keep.finish();
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Sheet1").to_string();
         note_elided(&mut wb, &name, elided.as_ref(), budget);
@@ -350,31 +350,124 @@ fn convert(d: Data) -> (Value, Option<String>) {
         Data::String(s) => (Value::Str(s), None),
         Data::Bool(b) => (Value::Bool(b), None),
         Data::DateTime(dt) => (Value::Num(dt.as_f64()), Some(serial_to_iso(dt.as_f64()))),
-        Data::DateTimeIso(s) | Data::DurationIso(s) => (Value::Str(s), None),
+        // Dates written as text (t="d", e.g. by SheetJS): a real date, like Excel shows.
+        Data::DateTimeIso(s) => match iso_to_serial(&s) {
+            Some(n) => (Value::Num(n), Some(serial_to_iso(n))),
+            None => (Value::Str(s), None),
+        },
+        Data::DurationIso(s) => (Value::Str(s), None),
         Data::Error(e) => (Value::Err { err: e.to_string() }, None),
     }
 }
 
-/// Cells into `keep`; returns the grid size (rows read, widest row).
-fn read_csv(path: &Path, delim: u8, keep: &mut Keep) -> Result<(u32, u32)> {
-    let mut rdr = csv::ReaderBuilder::new().has_headers(false).flexible(true).delimiter(delim).from_path(path)?;
+/// Cells into `keep`; returns the grid size (rows read, widest row). The
+/// delimiter is a tab for .tsv, else sniffed from the first line.
+fn read_csv(path: &Path, tsv: bool, keep: &mut Keep) -> Result<(u32, u32)> {
+    let mut text = csv_text(path)?;
+    let mut first = Vec::new();
+    text.read_until(b'\n', &mut first)?;
+    let delim = if tsv { b'\t' } else { csv_delimiter(&first) };
+    let input = std::io::Cursor::new(first).chain(text);
+    let mut rdr = csv::ReaderBuilder::new().has_headers(false).flexible(true).delimiter(delim).from_reader(input);
     let (mut rows, mut cols) = (0u32, 0u32);
-    for (r, rec) in rdr.records().enumerate() {
+    for (r, rec) in rdr.byte_records().enumerate() {
         let rec = rec?;
         rows = r as u32 + 1;
-        for (c, field) in rec.iter().enumerate() {
-            if field.is_empty() {
+        for (c, raw) in rec.iter().enumerate() {
+            if raw.is_empty() {
                 continue;
             }
             cols = cols.max(c as u32 + 1);
-            let v = match field.parse::<f64>() {
-                Ok(n) if field.trim() == field => Value::Num(n),
-                _ => Value::Str(field.to_string()),
+            let field = field_text(raw);
+            let (v, t) = if let Some(n) = csv_number(&field) {
+                // Keep how it was written when the number reads differently ("1.10",
+                // "+5"); not for exponents, which could then pass for a date.
+                let written = !field.contains(['e', 'E']) && fmt_num(n) != *field;
+                (Value::Num(n), written.then(|| field.to_string()))
+            } else if let Some(n) = iso_to_serial(&field) {
+                (Value::Num(n), Some(serial_to_iso(n)))
+            } else {
+                (Value::Str(field.into_owned()), None)
             };
-            keep.push(Cell { r: r as u32, c: c as u32, v, ..Default::default() });
+            keep.push(Cell { r: r as u32, c: c as u32, v, t, ..Default::default() });
         }
     }
     Ok((rows, cols))
+}
+
+/// A CSV's bytes, as UTF-8 where the file says what it is: a UTF-8 BOM is
+/// dropped, and UTF-16 with a BOM (Excel's "Unicode Text") is decoded here.
+/// Anything else streams through as is; see [`field_text`].
+fn csv_text(path: &Path) -> Result<Box<dyn BufRead>> {
+    type Utf16Unit = fn([u8; 2]) -> u16;
+    let mut f = BufReader::new(File::open(path)?);
+    let (bom, utf16): (usize, Option<Utf16Unit>) = match f.fill_buf()? {
+        [0xEF, 0xBB, 0xBF, ..] => (3, None),
+        [0xFF, 0xFE, ..] => (2, Some(u16::from_le_bytes)),
+        [0xFE, 0xFF, ..] => (2, Some(u16::from_be_bytes)),
+        _ => (0, None),
+    };
+    f.consume(bom);
+    let Some(unit) = utf16 else {
+        return Ok(Box::new(f));
+    };
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw)?;
+    let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|&b| unit(b)).collect();
+    Ok(Box::new(std::io::Cursor::new(String::from_utf16_lossy(&units).into_bytes())))
+}
+
+/// A field's text: UTF-8, or else Windows-1252, which is what Excel's
+/// "CSV (Comma delimited)" writes on Windows ("José", "Köln").
+fn field_text(raw: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.into(),
+        Err(_) => raw.iter().map(|&b| cp1252(b)).collect::<String>().into(),
+    }
+}
+
+fn cp1252(b: u8) -> char {
+    // Only 0x80–0x9F differ from Latin-1; the five unassigned bytes map to themselves.
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{81}', '\u{201A}', '\u{192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+        '\u{2C6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8D}', '\u{17D}', '\u{8F}',
+        '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+        '\u{2DC}', '\u{2122}', '\u{161}', '\u{203A}', '\u{153}', '\u{9D}', '\u{17E}', '\u{178}',
+    ];
+    if (0x80..=0x9F).contains(&b) { HIGH[(b - 0x80) as usize] } else { char::from(b) }
+}
+
+/// A CSV field that is plainly a number. Words Rust would also parse ("NaN",
+/// "inf") stay text, and so do leading zeros ("02134" is a ZIP or account
+/// code) and anything with more than 15 significant digits, which a number
+/// can't hold exactly (19-digit account numbers).
+fn csv_number(field: &str) -> Option<f64> {
+    let unsigned = field.strip_prefix(['-', '+']).unwrap_or(field);
+    let mantissa = unsigned.split(['e', 'E']).next().unwrap_or_default();
+    let whole = mantissa.split('.').next().unwrap_or_default();
+    let plain = unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && unsigned.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'));
+    let digits = mantissa.bytes().filter(u8::is_ascii_digit).skip_while(|&b| b == b'0').count();
+    if !plain || (whole.len() > 1 && whole.starts_with('0')) || digits > 15 {
+        return None;
+    }
+    field.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// The separator a .csv uses: whichever of comma, semicolon (common from
+/// European Excel), tab or pipe its first line has most of, outside quotes.
+fn csv_delimiter(first_line: &[u8]) -> u8 {
+    let mut quoted = false;
+    let mut counts = [(b',', 0usize), (b';', 0), (b'\t', 0), (b'|', 0)];
+    for &b in first_line {
+        if b == b'"' {
+            quoted = !quoted;
+        } else if !quoted && let Some(n) = counts.iter_mut().find(|(d, _)| *d == b) {
+            n.1 += 1;
+        }
+    }
+    // Ties and a one-column file stay comma.
+    counts.iter().fold((b',', 0), |best, &(d, n)| if n > best.1 { (d, n) } else { best }).0
 }
 
 #[cfg(test)]

@@ -59,8 +59,31 @@ pub fn naive_tokens(wb: &Workbook) -> usize {
     s
 }
 
+/// The folder for `wb` under `out`: its slug, unless another source with the
+/// same name (this run or an earlier one) owns it, as `orders.csv` and
+/// `orders.xlsx` would; then the slug plus its file type, then a number.
+/// Extracting the same source again reuses its folder.
+pub fn dir_for(out: &Path, wb: &Workbook) -> PathBuf {
+    let base = slug(wb);
+    let kind = if wb.source.kind.is_empty() { "file" } else { wb.source.kind.as_str() };
+    let names = [base.clone(), format!("{base}-{kind}")].into_iter().chain((2..).map(|n| format!("{base}-{kind}-{n}")));
+    for name in names {
+        let dir = out.join(name);
+        let owner = fs::read(dir.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok()).map(|m| m.id);
+        match owner {
+            Some(id) if !same_source(&id, &wb.source.id) => continue,
+            _ => return dir,
+        }
+    }
+    unreachable!("the numbered names never run out")
+}
+
+fn same_source(a: &str, b: &str) -> bool {
+    a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 pub fn save(out: &Path, wb: &Workbook, a: &Analysis, report: &str) -> Result<(PathBuf, Meta)> {
-    let dir = out.join(slug(wb));
+    let dir = dir_for(out, wb);
     fs::create_dir_all(&dir)?;
     let f = fs::File::create(dir.join("workbook.json.gz"))?;
     let mut gz = flate2::write::GzEncoder::new(BufWriter::new(f), flate2::Compression::fast());

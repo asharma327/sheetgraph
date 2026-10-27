@@ -32,5 +32,5 @@ We'll reply as soon as we can and agree on a fix and a disclosure date with you.
   spreadsheet can contain text aimed at the agent that reads the report. Treat the report as data in your agent's
   prompt, never as instructions.
 - **Files from strangers are untrusted input.** A crafted file can make an extraction slow or use a lot of memory
-  (workbooks over 10 million cells are summarized to bound memory). Crashes or hangs on such files are worth
+  (local files over 10 million cells are summarized to bound memory). Crashes or hangs on such files are worth
   reporting.

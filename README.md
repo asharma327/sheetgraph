@@ -4,7 +4,7 @@
 
 Extracts spreadsheets (Google Sheets, xlsx/xlsm/xls/xlsb/ods, csv) into a **compact map an LLM can read in one pass** plus a **formula dependency graph** — and saves the cells alongside it, so an agent can look up exact values when it needs to. Inspired by [graphify](https://github.com/Graphify-Labs/graphify) (overview report → scoped queries → full graph), but for spreadsheets.
 
-Workbooks up to **10 million cells** (Google Sheets' own limit) are kept whole. Bigger files still extract: the middle rows of their largest sheets are reduced to exact column totals (see [Known gaps](#known-gaps)).
+Local files up to **10 million cells** are kept whole. Bigger ones still extract: the middle rows of their largest sheets are summarized per column (exact counts, min and max, most common values; no sums). Google Sheets are always read whole (see [Known gaps](#known-gaps)).
 
 Made by [Love Spreadsheets](https://lovespreadsheets.com), which turns Google Sheets and Excel files into dashboards, CRMs, forms and other web apps with AI.
 
@@ -115,7 +115,7 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 - "typed arithmetic" is hand-entered sums like `=3820+3770`: data entry, not logic.
 - `▸ range table …` is a data block, one line per column: type and range, `enum` for small value sets, `fmt` for the number format, `ƒN` when the column is computed.
 - "same layout as X" means a sheet is a structural clone of an earlier one with different data; `sheetgraph sheet <dir> "<name>" --full` shows it in full.
-- `⋯ rows A–B summarized` means a very large sheet's middle rows were totalled rather than kept: the column profiles still count every row, but sample rows and `cells` don't show those rows.
+- `⋯ rows A–B summarized` means a very large sheet's middle rows were summarized per column rather than kept: the column profiles still count every row, but sample rows and `cells` don't show those rows.
 - Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`.
 
 ## Layout
@@ -140,7 +140,8 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 - Number-format display text (e.g. `$1,234.50`) is only rendered for dates in local files; the format itself is on every cell.
 - Spill ranges of array formulas are flagged on the formula but the spilled cells look like plain values.
 - INDIRECT/OFFSET targets are dynamic, so those edges are missing (flagged in the report).
-- **Very large workbooks**: up to 10 million cells are kept whole (about 0.2–0.4 GB of memory per million). Past that, a big sheet keeps its last 1,000 rows and its formulas, and totals the rows in between per column, so memory stays near 2–3 GB however big the file is (a 160 MB xlsx with 44 million cells: 3 GB, 84 s). REPORT.md's column profiles still count every row and say which rows were summarized; `cells` only lists kept rows, and `find` reports text matches in summarized rows by column. The budget is `xlsx::CELL_BUDGET`; `xlsx::read_limited` takes another.
+- **Very large local files**: up to 10 million cells are kept whole (about 0.2–0.4 GB of memory per million). Past that, a big sheet keeps its last 1,000 rows and its formulas, and summarizes the rows in between per column (counts, min and max, most common values; no sums), so memory stays near 2–3 GB however big the file is (a 160 MB xlsx with 44 million cells: 3 GB, 84 s). REPORT.md's column profiles still count every row and say which rows were summarized; `cells` only lists kept rows, and `find` reports text matches in summarized rows by column. The budget is `xlsx::CELL_BUDGET`; `xlsx::read_limited` takes another.
+- **Very large Google Sheets** are read whole, without that budget. Google allows up to 20 million cells, so a sheet near the limit can take several GB of memory.
 
 ## Development
 

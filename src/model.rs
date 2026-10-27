@@ -461,6 +461,47 @@ pub fn serial_to_iso(serial: f64) -> String {
     }
 }
 
+/// ISO 8601 date or date-time text ("2024-06-01", "2024-05-31T20:00:00.000Z") →
+/// serial. A zone suffix is ignored and the clock time kept as written, as Excel
+/// and openpyxl read it. None for anything else, including dates that don't exist.
+pub fn iso_to_serial(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).filter(|x| x.bytes().all(|c| c.is_ascii_digit()))?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days since 0000-03-01, then shifted to serial 0 = 1899-12-30 (see serial_to_iso).
+    let (y_mar, m_mar) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y_mar.div_euclid(400);
+    let yoe = y_mar - era * 400;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * m_mar + 2) / 5 + d - 1;
+    let date = (era * 146097 + doe - 719468 + 25569) as f64;
+    if serial_to_iso(date) != s[..10] {
+        return None; // e.g. 2024-02-31
+    }
+    let rest = &s[10..];
+    if rest.is_empty() {
+        return Some(date);
+    }
+    let time = rest.strip_prefix(['T', ' '])?.trim_end_matches('Z');
+    let time = match time.rfind(['+', '-']) {
+        Some(i) if i >= 5 => &time[..i], // "+02:00" / "-0400"
+        _ => time,
+    };
+    let mut hms = time.splitn(3, ':');
+    let h: f64 = hms.next()?.parse().ok()?;
+    let min: f64 = hms.next()?.parse().ok()?;
+    let sec: f64 = hms.next().map_or(Some(0.0), |x| x.parse().ok())?;
+    if !(0.0..24.0).contains(&h) || !(0.0..60.0).contains(&min) || !(0.0..61.0).contains(&sec) {
+        return None;
+    }
+    Some(date + (h * 3600.0 + min * 60.0 + sec) / 86400.0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -468,5 +509,21 @@ mod tests {
         assert_eq!(super::serial_to_iso(45000.0), "2023-03-15");
         assert_eq!(super::serial_to_iso(1.0), "1899-12-31");
         assert_eq!(super::serial_to_iso(45000.5), "2023-03-15 12:00");
+    }
+
+    #[test]
+    fn iso_dates() {
+        use super::{iso_to_serial, serial_to_iso};
+        assert_eq!(iso_to_serial("2023-03-15"), Some(45000.0));
+        assert_eq!(iso_to_serial("2023-03-15T12:00:00"), Some(45000.5));
+        assert_eq!(iso_to_serial("2023-03-15 12:00"), Some(45000.5));
+        let shown = |s: &str| iso_to_serial(s).map(serial_to_iso);
+        assert_eq!(shown("2024-05-31T20:00:00.000Z").as_deref(), Some("2024-05-31 20:00"));
+        assert_eq!(shown("2024-05-31T20:00:00+02:00").as_deref(), Some("2024-05-31 20:00"));
+        assert_eq!(shown("2024-02-29").as_deref(), Some("2024-02-29"));
+        assert_eq!(shown("1999-12-31").as_deref(), Some("1999-12-31"));
+        for bad in ["2024-02-30", "2023-13-01", "2024-06-00", "2024-6-1", "2024-06-01x", "2024-06-01 nan:00", "06/01/2024", "02134", ""] {
+            assert_eq!(iso_to_serial(bad), None, "{bad}");
+        }
     }
 }

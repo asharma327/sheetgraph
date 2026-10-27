@@ -26,6 +26,6 @@ First public release, as a beta.
   protection, Excel tables, charts, pivots, VBA modules, and links to other workbooks (`'[Budget.xlsx]Data'!B2`).
 - Excel tables resolve in the dependency graph, so `Sales[Amount]` counts as reading the table's sheet.
 - INDEX.md connects workbooks extracted together through IMPORTRANGE or Excel external links.
-- Workbooks of any size: xlsx is read cell by cell, every cell is kept up to 10 million, and past that big sheets
-  keep their last rows and formulas and total the rest per column, so memory stays bounded while the report's
-  column profiles still count every row.
+- Local workbooks of any size: xlsx is read cell by cell, every cell is kept up to 10 million, and past that big sheets
+  keep their last rows and formulas and summarize the rest per column (counts, ranges, most common values), so memory
+  stays bounded while the report's column profiles still count every row.

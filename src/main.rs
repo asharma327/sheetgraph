@@ -77,15 +77,38 @@ enum Cmd {
     },
 }
 
+/// Write to stdout. A reader that stops early (`sheetgraph cells … | head`)
+/// closes the pipe; that just ends the output, it isn't an error.
+fn emit(s: &str) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        r => Ok(r?),
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Extract { sources, out, creds, apps_script, full } => {
             std::fs::create_dir_all(&out)?;
-            let needs_google = sources.iter().any(|s| !std::path::Path::new(s).exists());
-            let auth = if needs_google { Some(gsheets::Auth::discover(creds.as_deref())?) } else { None };
-            if let Some(a) = &auth {
-                eprintln!("google auth: {}", a.identity());
-            }
+            let needs_google = !apps_script.is_empty()
+                || sources.iter().any(|s| !std::path::Path::new(s).exists() && sheetgraph::is_google_sheet(s));
+            // A Google login problem only fails the Google sources; local files still run.
+            let auth = if needs_google {
+                match gsheets::Auth::discover(creds.as_deref()) {
+                    Ok(a) => {
+                        eprintln!("google auth: {}", a.identity());
+                        Some(a)
+                    }
+                    Err(e) => {
+                        eprintln!("google auth failed: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let opts = if full { report::Opts::full() } else { report::Opts::default() };
             let mut failed = 0;
             for src in &sources {
@@ -99,7 +122,11 @@ fn main() -> Result<()> {
                     }
                 };
                 for id in &apps_script {
-                    match gsheets::fetch_apps_script(auth.as_ref().expect("google auth"), id) {
+                    let scripts = match &auth {
+                        Some(a) => gsheets::fetch_apps_script(a, id),
+                        None => Err(anyhow::anyhow!("Google credentials needed")),
+                    };
+                    match scripts {
                         Ok(s) => wb.scripts.extend(s),
                         Err(e) => wb.warnings.push(format!("apps script {id}: {e}")),
                     }
@@ -133,23 +160,23 @@ fn main() -> Result<()> {
             let a = analyze::analyze(&wb);
             let si = analyze::sheet_index(&wb, &sheet).ok_or_else(|| anyhow::anyhow!("no sheet {sheet:?}"))?;
             let opts = if full { report::Opts::full() } else { report::Opts::default() };
-            print!("{}", report::render_sheet(&wb, &a, si, &opts));
+            emit(&report::render_sheet(&wb, &a, si, &opts))?;
         }
         Cmd::Cells { dir, range, limit } => {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
-            print!("{}", query::cells(&wb, &a, &range, limit)?);
+            emit(&query::cells(&wb, &a, &range, limit)?)?;
         }
         Cmd::Trace { dir, cell, depth, up, down } => {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
             let (u, d) = if !up && !down { (true, true) } else { (up, down) };
-            print!("{}", query::trace(&wb, &a, &cell, depth, u, d)?);
+            emit(&query::trace(&wb, &a, &cell, depth, u, d)?)?;
         }
         Cmd::Find { dir, text, limit } => {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
-            print!("{}", query::find(&wb, &a, &text, limit));
+            emit(&query::find(&wb, &a, &text, limit))?;
         }
         Cmd::Rebuild { out, full } => {
             let opts = if full { report::Opts::full() } else { report::Opts::default() };
@@ -170,7 +197,7 @@ fn main() -> Result<()> {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
             let opts = if full { report::Opts::full() } else { report::Opts::default() };
-            print!("{}", report::render(&wb, &a, &opts));
+            emit(&report::render(&wb, &a, &opts))?;
         }
     }
     Ok(())

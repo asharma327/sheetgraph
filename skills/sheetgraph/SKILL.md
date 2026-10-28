@@ -42,13 +42,15 @@ Notation:
 - `▸ range table …` is a data block, one line per column: type and range, `enum` for small value sets, `fmt` for the number format, `ƒN` when computed.
 - `⋯ rows A–B summarized`: a very large sheet's middle rows are summarized per column, not kept.
 - Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`.
+- Scripts: one line per macro with its trigger, what it `writes` and `uses`, and what it `calls`. `,…` means more cells whose address is built at run time; `(not in file)` is a sheet the macro creates. Values a macro writes are pasted values in the sheet, not formulas: check here before calling a number hardcoded.
 
 ## 4. Drill down for exact values (offline, fast)
 
 ```bash
 sheetgraph cells  sheetgraph-out/<wb> "'Sheet Name'!A1:F20"   # exact values, formulas, formats
 sheetgraph trace  sheetgraph-out/<wb> "Summary!B4" --depth 3  # precedents and dependents
-sheetgraph find   sheetgraph-out/<wb> "VAT"                   # search text, formulas and names
+sheetgraph find   sheetgraph-out/<wb> "VAT"                   # search text, formulas, names and macro code
+sheetgraph macro  sheetgraph-out/<wb> RollUp                  # a macro's code (no name: every macro and what it touches)
 sheetgraph sheet  sheetgraph-out/<wb> "Ledger" --full         # one sheet's section, untruncated
 ```
 

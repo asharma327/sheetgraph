@@ -66,6 +66,10 @@ pub struct Sheet {
     pub frozen_cols: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_color: Option<String>,
+    /// The sheet's VBA code name (`Sheet1`), which macros can use in place of
+    /// `Worksheets("Data")` and which names the sheet's own code module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_name: Option<String>,
     /// Sparse, sorted by (row, col).
     pub cells: Vec<Cell>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -371,6 +375,17 @@ pub struct Script {
     pub kind: String,
     pub name: String,
     pub source: String,
+}
+
+impl Script {
+    /// Whether the module holds any code. Excel gives every sheet and the
+    /// workbook a module, and most stay `Attribute …` / `Option …` lines only.
+    pub fn has_code(&self) -> bool {
+        self.source.lines().map(str::trim).any(|l| {
+            let lower = l.to_ascii_lowercase();
+            !(l.is_empty() || l.starts_with('\'') || lower.starts_with("attribute ") || lower.starts_with("option ") || lower.starts_with("rem "))
+        })
+    }
 }
 
 fn is_false(b: &bool) -> bool {

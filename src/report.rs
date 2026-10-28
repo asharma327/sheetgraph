@@ -251,9 +251,25 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
 
     if !wb.scripts.is_empty() {
         let _ = writeln!(s, "\n## Scripts");
-        for sc in &wb.scripts {
-            let procs = procedures(&sc.source);
-            let _ = writeln!(s, "{} {} ({} lines): {}", sc.kind, sc.name, sc.source.lines().count(), trunc(&procs.join(", "), 400));
+        let mut empty = Vec::new();
+        for (i, sc) in wb.scripts.iter().enumerate() {
+            if !sc.has_code() {
+                empty.push(sc.name.as_str());
+                continue;
+            }
+            let procs: Vec<_> = a.macros.iter().filter(|p| p.script == i).collect();
+            let names: Vec<&str> = procs.iter().map(|p| p.name.as_str()).collect();
+            let _ = writeln!(s, "{} {} ({} lines): {}", sc.kind, sc.name, sc.source.lines().count(), trunc(&names.join(", "), 400));
+            for p in procs {
+                if let Some(d) = crate::macros::describe(wb, a, p, 6) {
+                    let _ = writeln!(s, "  {}: {}", p.name, trunc(&d, 300));
+                }
+            }
+        }
+        if !empty.is_empty() {
+            let n = empty.len();
+            let names = if n > 8 { format!("{} …", empty[..8].join(", ")) } else { empty.join(", ") };
+            let _ = writeln!(s, "{n} module{} with no code: {names}", if n == 1 { "" } else { "s" });
         }
     }
     if !wb.developer_metadata.is_empty() {
@@ -274,23 +290,6 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         s.push_str(&render_sheet(wb, a, si, o));
     }
     s
-}
-
-fn procedures(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in src.lines() {
-        let t = line.trim_start();
-        let lower = t.to_ascii_lowercase();
-        for kw in ["function ", "sub ", "public sub ", "private sub ", "public function ", "private function ", "async function "] {
-            if lower.starts_with(kw) {
-                let name: String = t[kw.len()..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                if !name.is_empty() {
-                    out.push(name);
-                }
-            }
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------- sheet

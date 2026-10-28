@@ -55,7 +55,14 @@ enum Cmd {
         #[arg(long)]
         down: bool,
     },
-    /// Search values, formulas and notes.
+    /// List macro / script modules and procedures with the sheets and ranges each
+    /// writes or uses; with NAME (module, procedure or Module.Procedure), print its code.
+    #[command(visible_alias = "macros")]
+    Macro {
+        dir: PathBuf,
+        name: Option<String>,
+    },
+    /// Search values, formulas, notes and macro code.
     Find {
         dir: PathBuf,
         text: String,
@@ -177,6 +184,11 @@ fn main() -> Result<()> {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
             emit(&query::find(&wb, &a, &text, limit))?;
+        }
+        Cmd::Macro { dir, name } => {
+            let wb = store::load(&dir)?;
+            let a = analyze::analyze(&wb);
+            emit(&query::macros(&wb, &a, name.as_deref())?)?;
         }
         Cmd::Rebuild { out, full } => {
             let opts = if full { report::Opts::full() } else { report::Opts::default() };

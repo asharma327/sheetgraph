@@ -10,6 +10,7 @@ pub mod analyze;
 pub mod formula;
 pub mod graph;
 pub mod gsheets;
+pub mod macros;
 pub mod model;
 pub mod ooxml;
 pub mod query;

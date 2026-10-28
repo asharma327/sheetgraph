@@ -13,6 +13,16 @@ All notable changes to this project are documented here. The format follows
 - `install.sh`, a one-line installer for macOS and Linux that downloads the latest release binary.
 - Agent skill (`skills/sheetgraph/SKILL.md`) and a Claude Code plugin marketplace (`.claude-plugin/`), so agents run sheetgraph on their own when asked about a spreadsheet.
 - README: before/after demo image (`assets/demo.png`) and the script that generates its sample workbook.
+- Macros: each VBA procedure's trigger (workbook and sheet events, `Auto_Open`), the sheets and ranges it writes and
+  uses, the procedures it calls, and the formula cells that call it as a function, in REPORT.md and as `macro` nodes
+  with `writes` / `uses` / `calls` edges in graph.json. Apps Script functions are listed with their triggers.
+- `sheetgraph macro <dir> [name]` lists macros or prints one module's or procedure's code; `find` also searches
+  macro code.
+- Sheets' VBA code names are read from xlsx/xlsm (`Sheet.code_name`).
+
+### Changed
+
+- REPORT.md counts modules with no code (the empty module Excel gives every sheet) instead of listing each one.
 
 ## [0.1.0]
 

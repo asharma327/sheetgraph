@@ -2,6 +2,7 @@
 
 use crate::a1::{quote_sheet, Rect};
 use crate::analyze::Analysis;
+use crate::macros::At;
 use crate::model::Workbook;
 use serde_json::{json, Value as J};
 
@@ -14,6 +15,9 @@ pub fn group_id(si: usize, gi: usize) -> String {
 }
 pub fn block_id(si: usize, bi: usize) -> String {
     format!("s{}.b{}", si + 1, bi + 1)
+}
+pub fn macro_id(wb: &Workbook, p: &crate::macros::Proc) -> String {
+    format!("macro:{}.{}", wb.scripts[p.script].name, p.name)
 }
 
 pub fn build(wb: &Workbook, a: &Analysis) -> J {
@@ -85,6 +89,48 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
     }
     for n in &wb.named_ranges {
         nodes.push(json!({"id": format!("name:{}", n.name), "type": "named_range", "range": n.range}));
+    }
+    for p in &a.macros {
+        let id = macro_id(wb, p);
+        let sc = &wb.scripts[p.script];
+        nodes.push(json!({
+            "id": id, "type": "macro", "lang": sc.kind, "module": sc.name, "name": p.name, "kind": p.kind,
+            "lines": format!("{}-{}", p.lines.0, p.lines.1),
+            "trigger": p.trigger.as_ref().map(|t| t.event.clone()),
+            "trigger_sheet": p.trigger.as_ref().and_then(|t| t.sheet).map(|s| format!("s{}", s + 1)),
+        }));
+        for t in &p.touches {
+            let kind = if t.write { "writes" } else { "uses" };
+            let range = crate::macros::place(wb, t);
+            match &t.at {
+                At::Sheet(s) => {
+                    let ts = t.rect.map(|r| targets(a, *s, &r, None)).unwrap_or_default();
+                    if ts.is_empty() || ts.len() > MAX_TARGETS {
+                        edges.push(json!({"from": id, "to": format!("s{}", s + 1), "kind": kind, "range": range}));
+                    } else {
+                        for to in ts {
+                            edges.push(json!({"from": id, "to": to, "kind": kind, "range": range}));
+                        }
+                    }
+                }
+                At::Missing(name) => edges.push(json!({"from": id, "to": null, "kind": kind, "range": range, "missing_sheet": name})),
+                // Which sheet is active when it runs isn't known.
+                At::Active => {}
+            }
+        }
+        for &c in &p.calls {
+            edges.push(json!({"from": id, "to": macro_id(wb, &a.macros[c]), "kind": "calls"}));
+        }
+    }
+    // Worksheet formulas calling VBA functions (UDFs).
+    for (si, sa) in a.sheets.iter().enumerate() {
+        for (gi, g) in sa.groups.iter().enumerate() {
+            for f in &g.funcs {
+                if let Some(p) = a.macros.iter().find(|p| p.kind == "function" && p.name.eq_ignore_ascii_case(f)) {
+                    edges.push(json!({"from": group_id(si, gi), "to": macro_id(wb, p), "kind": "calls"}));
+                }
+            }
+        }
     }
     json!({
         "schema": SCHEMA,

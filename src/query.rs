@@ -283,6 +283,17 @@ pub fn find(wb: &Workbook, a: &Analysis, needle: &str, limit: usize) -> String {
             }
         }
     }
+    for (i, sc) in wb.scripts.iter().enumerate() {
+        for (ln, line) in sc.source.lines().enumerate() {
+            if line.to_lowercase().contains(&n) {
+                hits += 1;
+                if hits <= limit {
+                    let p = a.macros.iter().find(|p| p.script == i && p.lines.0 <= ln + 1 && ln < p.lines.1);
+                    let _ = writeln!(s, "{} {}:{}{}: {}", sc.kind, sc.name, ln + 1, p.map(|p| format!(" ({})", p.name)).unwrap_or_default(), trunc(line.trim(), 160));
+                }
+            }
+        }
+    }
     if hits > limit {
         let _ = writeln!(s, "… {} hits total (raise --limit)", hits);
     }
@@ -309,4 +320,62 @@ pub fn find(wb: &Workbook, a: &Analysis, needle: &str, limit: usize) -> String {
         s.push_str("no matches\n");
     }
     s
+}
+
+/// Without `name`, every module and procedure with what each touches. With
+/// it, the code of a module, a procedure, or `Module.Procedure`, numbered.
+pub fn macros(wb: &Workbook, a: &Analysis, name: Option<&str>) -> Result<String> {
+    let mut s = String::new();
+    let Some(name) = name else {
+        if wb.scripts.is_empty() {
+            return Ok("no macros or scripts in this workbook\n".into());
+        }
+        let mut empty = Vec::new();
+        for (i, sc) in wb.scripts.iter().enumerate() {
+            if !sc.has_code() {
+                empty.push(sc.name.as_str());
+                continue;
+            }
+            let _ = writeln!(s, "{} {} ({} lines)", sc.kind, sc.name, sc.source.lines().count());
+            for p in a.macros.iter().filter(|p| p.script == i) {
+                let d = crate::macros::describe(wb, a, p, usize::MAX).map(|d| format!(" · {d}")).unwrap_or_default();
+                let _ = writeln!(s, "  {} {} lines {}-{}{d}", p.kind, p.name, p.lines.0, p.lines.1);
+            }
+        }
+        if !empty.is_empty() {
+            let _ = writeln!(s, "no code: {}", empty.join(", "));
+        }
+        return Ok(s);
+    };
+    let numbered = |s: &mut String, src: &str, from: usize, to: usize| {
+        for (n, line) in src.lines().enumerate().skip(from - 1).take(to + 1 - from) {
+            let _ = writeln!(s, "{:>5}  {}", n + 1, line);
+        }
+    };
+    if let Some(sc) = wb.scripts.iter().find(|sc| sc.name.eq_ignore_ascii_case(name)) {
+        let _ = writeln!(s, "{} {} ({} lines)", sc.kind, sc.name, sc.source.lines().count());
+        numbered(&mut s, &sc.source, 1, sc.source.lines().count().max(1));
+        return Ok(s);
+    }
+    let (module, proc) = match name.split_once('.') {
+        Some((m, p)) => (Some(m), p),
+        None => (None, name),
+    };
+    let found: Vec<_> = a
+        .macros
+        .iter()
+        .filter(|p| p.name.eq_ignore_ascii_case(proc) && module.is_none_or(|m| wb.scripts[p.script].name.eq_ignore_ascii_case(m)))
+        .collect();
+    if found.is_empty() {
+        let mut names: Vec<String> = wb.scripts.iter().filter(|sc| sc.has_code()).map(|sc| sc.name.clone()).collect();
+        names.extend(a.macros.iter().map(|p| format!("{}.{}", wb.scripts[p.script].name, p.name)));
+        return Err(anyhow!("no module or procedure {name:?}; have: {}", trunc(&names.join(", "), 600)));
+    }
+    for p in found {
+        let sc = &wb.scripts[p.script];
+        let d = crate::macros::describe(wb, a, p, usize::MAX).map(|d| format!("\n{d}")).unwrap_or_default();
+        let _ = writeln!(s, "{} {}.{} lines {}-{}{d}", p.kind, sc.name, p.name, p.lines.0, p.lines.1);
+        numbered(&mut s, &sc.source, p.lines.0, p.lines.1);
+    }
+    Ok(s)
 }

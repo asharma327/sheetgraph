@@ -22,6 +22,8 @@ pub struct Analysis {
     /// References to sheets that do not exist in this workbook.
     pub broken_refs: BTreeMap<String, u64>,
     pub named: HashMap<String, (Option<usize>, Rect)>,
+    /// Procedures in the workbook's macro / script modules.
+    pub macros: Vec<crate::macros::Proc>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,12 +111,14 @@ pub fn analyze(wb: &Workbook) -> Analysis {
         func_cells: BTreeMap::new(),
         broken_refs: BTreeMap::new(),
         named,
+        macros: Vec::new(),
     };
     for (si, sh) in wb.sheets.iter().enumerate() {
         let sa = analyze_sheet(wb, si, sh, &mut a);
         a.sheets.push(sa);
     }
     find_clones(wb, &mut a);
+    a.macros = crate::macros::analyze(wb, &a);
     a
 }
 

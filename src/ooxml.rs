@@ -449,7 +449,10 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
 
     for n in &sx.nodes {
         match n.name.as_str() {
-            "sheetPr" => sh.tab_color = n.child("tabColor").and_then(|c| cx.styles.colors.of(c)),
+            "sheetPr" => {
+                sh.tab_color = n.child("tabColor").and_then(|c| cx.styles.colors.of(c));
+                sh.code_name = n.attr("codeName").map(str::to_string);
+            }
             "sheetViews" => {
                 if let Some(p) = n.child("sheetView").and_then(|v| v.child("pane")).filter(|p| p.attr("state").is_some_and(|s| s.starts_with("frozen"))) {
                     sh.frozen_rows = p.num("ySplit").unwrap_or(0);

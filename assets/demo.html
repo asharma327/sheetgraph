@@ -1,0 +1,80 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { width: 1600px; height: 750px; background: #0f1115; font-family: -apple-system, "Inter", "Helvetica Neue", sans-serif; color: #e8eaed; padding: 56px 64px; }
+  h1 { font-size: 44px; font-weight: 750; letter-spacing: -0.5px; }
+  h1 span { color: #7ee2a8; }
+  .sub { margin-top: 10px; font-size: 21px; color: #9aa0a6; }
+  .row { display: flex; gap: 28px; margin-top: 40px; align-items: stretch; }
+  .panel { flex: 1; border-radius: 14px; overflow: hidden; background: #fff; display: flex; flex-direction: column; }
+  .label { display: flex; justify-content: space-between; align-items: baseline; padding: 14px 18px; background: #1b1e24; color: #e8eaed; font-size: 18px; font-weight: 650; }
+  .label b { font-size: 26px; font-weight: 800; }
+  .before .label b { color: #ff8a80; }
+  .after .label b { color: #7ee2a8; }
+  .arrow { width: 92px; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #9aa0a6; font: 600 14px ui-monospace, Menlo, monospace; text-align: center; gap: 8px; }
+  .arrow div { font-size: 44px; color: #7ee2a8; }
+  table { border-collapse: collapse; font: 13px "Helvetica Neue", Arial, sans-serif; color: #202124; width: 100%; }
+  td, th { border: 1px solid #dadce0; padding: 5px 6px; white-space: nowrap; overflow: hidden; max-width: 120px; }
+  th { background: #f1f3f4; color: #5f6368; font-weight: 500; text-align: center; }
+  tr.h td { font-weight: 700; background: #f8f9fa; }
+  .y { background: #ffff00; } .p { background: #ff99cc; }
+  .typed { background: #fde7e9; color: #c5221f; font-weight: 700; }
+  .fx { color: #1a73e8; }
+  .fade { color: #9aa0a6; text-align: center; font-size: 15px; padding: 8px; }
+  .tabs { display: flex; gap: 2px; background: #f1f3f4; padding: 6px 8px; font: 12px "Helvetica Neue", Arial; margin-top: auto; }
+  .tabs span { padding: 4px 10px; background: #e8eaed; border-radius: 4px 4px 0 0; color: #3c4043; }
+  .tabs .on { background: #fff; font-weight: 700; } .tabs .red { background: #d93025; color: #fff; }
+  pre { flex: 1; background: #16191f; color: #c9d1d9; font: 13.2px/1.55 ui-monospace, "SF Mono", Menlo, monospace; padding: 16px 18px; white-space: pre; overflow: hidden; }
+  .k { color: #7ee2a8; } .m { color: #8ab4f8; } .w { color: #ffb4a9; background: rgba(255,138,128,0.12); } .d { color: #8b949e; }
+  .foot { margin-top: 26px; display: flex; justify-content: space-between; color: #9aa0a6; font-size: 18px; }
+  .foot code { color: #e8eaed; font: 600 18px ui-monospace, Menlo, monospace; background: #1b1e24; padding: 6px 12px; border-radius: 8px; }
+</style></head>
+<body>
+  <h1>Your spreadsheet, as a map an <span>LLM can actually read</span></h1>
+  <div class="sub">sheetgraph turns Excel and Google Sheets into a short report plus a formula graph. Open source, written in Rust.</div>
+  <div class="row">
+    <div class="panel before">
+      <div class="label">Jobs tracker.xlsx · 141,000 cells <b>≈ 961k tokens</b></div>
+      <table>
+        <tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th><th>E</th><th>G</th><th>H</th><th>I</th></tr>
+        <tr class="h"><td>1</td><td>Job #</td><td>Address</td><td>Start</td><td>Sub</td><td>Trade</td><td>Rate</td><td>Quote</td><td>Paid?</td></tr>
+        <tr><td>2</td><td>J-00002</td><td>45 Saltmarsh</td><td>2021-01-04</td><td>Tom H</td><td>deck</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F2*G2*(1+…</td><td>Y</td></tr>
+        <tr><td>3</td><td>J-00003</td><td>64 Cedar Rise</td><td>2021-01-04</td><td>Maya</td><td>deck</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F3*G3*(1+…</td><td>partial</td></tr>
+        <tr><td>16</td><td class="p">J-00016</td><td>12 Harrow St</td><td>2021-01-06</td><td>Priya</td><td>roof</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F16*G16*(…</td><td>N</td></tr>
+        <tr><td>34</td><td>J-00034</td><td>201 Wexford Ln</td><td>2021-01-09</td><td>Sam</td><td>bath</td><td class="fx">=VLOOKUP(…</td><td class="typed">47000</td><td>N</td></tr>
+        <tr><td>55</td><td class="y">J-00055</td><td>88 Fairmont St</td><td>2021-01-13</td><td>Dmitri K</td><td>kitchen</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F55*G55*(…</td><td>Y</td></tr>
+        <tr><td>74</td><td>J-00074</td><td>9 Beacon Hill</td><td>2021-01-16</td><td>Maya</td><td>siding</td><td class="fx">=VLOOKUP(…</td><td class="typed">21500</td><td>partial</td></tr>
+        <tr><td>77</td><td>J-00077</td><td>31 Larkspur Dr</td><td>2021-01-16</td><td>Tom H</td><td>garage</td><td class="fx">=VLOOKUP(…</td><td class="typed">80000</td><td>N</td></tr>
+        <tr><td>121</td><td>J-00121</td><td>3 Marlow Cl</td><td>2021-01-24</td><td>Priya</td><td>deck</td><td class="fx">=VLOOKUP(…</td><td class="typed">14000</td><td>Y</td></tr>
+        <tr><td>137</td><td class="y">J-00137</td><td>48 Harrow St</td><td>2021-01-26</td><td>Sam</td><td>roof</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F137*G137…</td><td>partial</td></tr>
+        <tr><td>158</td><td class="y">J-00158</td><td>14 Saltmarsh</td><td>2021-01-30</td><td>Dmitri K</td><td>bath</td><td class="fx">=VLOOKUP(…</td><td class="fx">=F158*G158…</td><td>N</td></tr>
+        <tr><td colspan="9" class="fade">⋮ 11,990 more rows · 48,000 formulas · typed-over values hiding in column H</td></tr>
+      </table>
+      <div class="tabs"><span class="on">Jobs</span><span>Rates</span><span>Summary</span><span class="red">DO NOT TOUCH</span></div>
+    </div>
+    <div class="arrow"><div>→</div>sheetgraph<br>extract</div>
+    <div class="panel after">
+      <div class="label">REPORT.md <b>≈ 940 tokens · 1,000× smaller</b></div>
+<pre><span class="k">## 1. Jobs</span> · A1:L12001 · 141k cells
+reads: Rates · read by: Summary
+<span class="m">▸ A1:L12001 table 12001×12, header row 1</span>
+  C "Start": date 2021-01-04 … 2026-06-27
+  D "Sub": enum Dmitri K(2441) Maya(2424) Priya(2403) …
+  I "Paid?": enum partial(4028) Y(4009) N(3963)
+<span class="k">ƒ formulas</span> (48k cells, 247 groups)
+ƒ1   G2:G12001 ↓ =VLOOKUP(E2,Rates!$A$2:$C$7,2,FALSE)
+ƒ2   H2:H33 ↓ =F2*G2*(1+VLOOKUP(E2,Rates!$A$2:$C$7,3,FALSE))
+     same formula in 244 ranges
+<span class="w">     breaks at H34, H74, H77 … = 249 hardcoded values</span>
+ƒ246 J2:J12001 ↓ =IF(I2="Y",0,H2)
+ƒ247 K2:K12001 ↓ =MONTH(C2)
+<span class="k">✓ validation</span>  I2:I12001: dropdown [Y, N, partial]
+
+<span class="k">## 3. Summary</span> · reads: Jobs
+ƒ2 B2:B13 ↓ =SUMIF(Jobs!K:K,A2,Jobs!H:H)
+<span class="d">+ graph.json · every cell saved for exact lookups</span></pre>
+    </div>
+  </div>
+  <div class="foot"><code>sheetgraph extract budget.xlsx</code><span>xlsx · xlsm · xls · ods · csv · Google Sheets</span></div>
+</body></html>

@@ -1,0 +1,16 @@
+{
+  "name": "sheetgraph",
+  "description": "sheetgraph: read spreadsheets with your AI agent, as a short report plus a formula graph.",
+  "owner": {
+    "name": "Love Spreadsheets",
+    "url": "https://lovespreadsheets.com"
+  },
+  "plugins": [
+    {
+      "name": "sheetgraph",
+      "source": "./",
+      "description": "Read Excel, CSV and Google Sheets with sheetgraph: a short report plus a formula graph instead of every cell.",
+      "version": "0.1.0"
+    }
+  ]
+}

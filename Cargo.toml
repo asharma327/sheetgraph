@@ -9,7 +9,7 @@ repository = "https://github.com/asharma327/spreadsheet-extractor"
 readme = "README.md"
 keywords = ["spreadsheet", "excel", "xlsx", "google-sheets", "llm"]
 categories = ["command-line-utilities", "parser-implementations", "text-processing"]
-exclude = ["/.github", "/tests/fixtures/*.py"]
+exclude = ["/.github", "/.claude-plugin", "/assets", "/install.sh", "/tests/fixtures/*.py"]
 
 [dependencies]
 anyhow = "1.0.104"

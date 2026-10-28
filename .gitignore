@@ -3,3 +3,4 @@
 .DS_Store
 # credentials: never commit service-account keys
 *.json
+!.claude-plugin/*.json

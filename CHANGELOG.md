@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt binaries for macOS (Apple silicon and Intel), Linux (x86_64 and arm64) and Windows, attached to each
+  GitHub release by `.github/workflows/release.yml`.
+- `install.sh`, a one-line installer for macOS and Linux that downloads the latest release binary.
+- Agent skill (`skills/sheetgraph/SKILL.md`) and a Claude Code plugin marketplace (`.claude-plugin/`), so agents run sheetgraph on their own when asked about a spreadsheet.
+- README: before/after demo image (`assets/demo.png`) and the script that generates its sample workbook.
+
 ## [0.1.0]
 
 First public release, as a beta.

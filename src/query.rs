@@ -3,7 +3,7 @@
 //! reading REPORT.md.
 
 use crate::a1::{cell_name, parse_ref, quote_sheet, Rect};
-use crate::analyze::{cells_in, cover, find_cell, sheet_index, Analysis};
+use crate::analyze::{cells_in, cover, find_cell, sheet_index, sheet_span, Analysis};
 use crate::formula::lex;
 use crate::model::{Cell, Workbook};
 use crate::report::trunc;
@@ -37,12 +37,31 @@ fn describe_cell(wb: &Workbook, a: &Analysis, si: usize, c: &Cell) -> String {
         bits.extend(st.num_fmt.clone().map(|f| format!("fmt {f}")));
         bits.extend(st.bg.clone().map(|b| format!("bg{b}")));
         bits.extend(st.fg.clone().map(|b| format!("fg{b}")));
-        if st.bold {
-            bits.push("bold".into());
+        for (on, name) in [(st.bold, "bold"), (st.italic, "italic"), (st.strike, "strike"), (st.unlocked, "unlocked"), (st.hidden_formula, "formula hidden")] {
+            if on {
+                bits.push(name.into());
+            }
         }
         if !bits.is_empty() {
             let _ = write!(s, "  [{}]", bits.join(" "));
         }
+    }
+    if !c.runs.is_empty() {
+        let _ = write!(s, "  [rich text: {}]", trunc(&crate::report::runs_text(c), 200));
+    }
+    if let Some(o) = &c.obj {
+        let mut t = o.kind.clone();
+        if let Some(x) = &o.text {
+            let _ = write!(t, " \"{}\"", trunc(x, 60));
+        }
+        if let Some(x) = &o.target {
+            let _ = write!(t, " {}", trunc(x, 80));
+        }
+        if !o.props.is_empty() {
+            let props: Vec<String> = o.props.iter().map(|(k, v)| format!("{k}={}", trunc(v, 40))).collect();
+            let _ = write!(t, " {{{}}}", trunc(&props.join(", "), 300));
+        }
+        let _ = write!(s, "  [{t}]");
     }
     if let Some(d) = c.dv {
         let v = &wb.validations[d as usize];
@@ -168,10 +187,10 @@ fn precedents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max
                 continue;
             }
             let ts = match &t.sheet {
-                None => Some(si),
-                Some(n) => sheet_index(wb, n),
+                None => vec![si],
+                Some(n) => sheet_span(wb, n),
             };
-            if let Some(ts) = ts {
+            for ts in ts {
                 merge_ref(&mut refs, ts, r);
             }
         }
@@ -231,11 +250,11 @@ fn dependents(wb: &Workbook, a: &Analysis, si: usize, rect: &Rect, d: usize, max
                     }
                     let (dr, dc) = (r as i64 - g.rect.r0 as i64, c as i64 - g.rect.c0 as i64);
                     let hit = lx.refs.iter().any(|t| {
-                        let ts = match &t.sheet {
-                            None => Some(gs),
-                            Some(n) => sheet_index(wb, n),
+                        let on = match &t.sheet {
+                            None => gs == si,
+                            Some(n) => sheet_span(wb, n).contains(&si),
                         };
-                        ts == Some(si) && t.rect_at(dr, dc).is_some_and(|x| x.intersects(rect))
+                        on && t.rect_at(dr, dc).is_some_and(|x| x.intersects(rect))
                     }) || lx.names.iter().any(|n| a.named.get(&n.to_ascii_uppercase()).is_some_and(|(ns, x)| ns.unwrap_or(gs) == si && x.intersects(rect)));
                     if hit {
                         hits.push(((), r, c));

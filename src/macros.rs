@@ -227,6 +227,14 @@ pub fn place(wb: &Workbook, t: &Touch) -> String {
 /// One line on what a procedure does: its trigger, formula use, the ranges it
 /// writes and uses, the procedures it calls. `max` caps each list. None when
 /// there's nothing to say beyond its name.
+/// Whether a shape's `on_click` (`RollUp` or `Module1.RollUp`) names this procedure.
+pub fn clicks(on_click: &str, wb: &Workbook, p: &Proc) -> bool {
+    match on_click.rsplit_once('.') {
+        Some((m, n)) => n.eq_ignore_ascii_case(&p.name) && m.eq_ignore_ascii_case(&wb.scripts[p.script].name),
+        None => on_click.eq_ignore_ascii_case(&p.name),
+    }
+}
+
 pub fn describe(wb: &Workbook, a: &Analysis, p: &Proc, max: usize) -> Option<String> {
     let list = |v: Vec<String>, sep: &str| {
         let more = v.len().saturating_sub(max);
@@ -242,6 +250,12 @@ pub fn describe(wb: &Workbook, a: &Analysis, p: &Proc, max: usize) -> Option<Str
             Some(s) => parts.push(format!("runs on {} {}", quote_sheet(&wb.sheets[s].name), t.event)),
             None if wb.scripts[p.script].kind == "vba" => parts.push(format!("runs on workbook {}", t.event)),
             None => parts.push(format!("trigger {}", t.event)),
+        }
+    }
+    for sh in &wb.sheets {
+        for x in sh.shapes.iter().filter(|x| x.on_click.as_deref().is_some_and(|m| clicks(m, wb, p))) {
+            let label = x.text.as_deref().or(Some(x.name.as_str()).filter(|n| !n.is_empty())).map(|t| format!(" \"{}\"", crate::report::trunc(t, 40)));
+            parts.push(format!("run by {}{} on {}", x.kind, label.unwrap_or_default(), quote_sheet(&sh.name)));
         }
     }
     let n = formula_cells(a, p);

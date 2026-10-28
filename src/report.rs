@@ -120,6 +120,7 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         k(ng as u64),
         if ne > 0 { format!(" · {} error cells", k(ne)) } else { String::new() }
     );
+    workbook_settings(&mut s, wb);
     let _ = writeln!(
         s,
         "Notation: ƒN = formula copy-group N of a sheet; a group's formula is shown at its top-left cell and is copied (relative refs shift) over its range. ↓ filled down, → across, ▦ both."
@@ -182,8 +183,22 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         }
     }
 
-    if !a.externals.is_empty() || !a.broken_refs.is_empty() || !wb.data_sources.is_empty() || !wb.external_links.is_empty() {
+    if !a.externals.is_empty() || !a.broken_refs.is_empty() || !wb.data_sources.is_empty() || !wb.external_links.is_empty() || !wb.connections.is_empty() {
         let _ = writeln!(s, "\n## External links");
+        for c in &wb.connections {
+            let mut how = vec![c.kind.clone()];
+            if c.refresh_on_open {
+                how.push("refreshes on open".into());
+            }
+            let mut line = format!("connection \"{}\" ({})", c.name, how.join(", "));
+            if let Some(src) = &c.source {
+                let _ = write!(line, ": {}", trunc(src, 160));
+            }
+            if let Some(cmd) = &c.command {
+                let _ = write!(line, " · {}", trunc(cmd, 160));
+            }
+            let _ = writeln!(s, "{line}");
+        }
         for l in &wb.external_links {
             let sheets = if l.sheets.is_empty() { String::new() } else { format!(" · sheets: {}", trunc(&l.sheets.join(", "), 120)) };
             let _ = writeln!(s, "linked workbook [{}] = {}{sheets}", l.name, trunc(&l.target, 160));
@@ -259,7 +274,8 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
             }
             let procs: Vec<_> = a.macros.iter().filter(|p| p.script == i).collect();
             let names: Vec<&str> = procs.iter().map(|p| p.name.as_str()).collect();
-            let _ = writeln!(s, "{} {} ({} lines): {}", sc.kind, sc.name, sc.source.lines().count(), trunc(&names.join(", "), 400));
+            let what = if names.is_empty() { script_gist(sc) } else { names.join(", ") };
+            let _ = writeln!(s, "{} {} ({} lines){}", sc.kind, sc.name, sc.source.lines().count(), if what.is_empty() { String::new() } else { format!(": {}", trunc(&what, 400)) });
             for p in procs {
                 if let Some(d) = crate::macros::describe(wb, a, p, 6) {
                     let _ = writeln!(s, "  {}: {}", p.name, trunc(&d, 300));
@@ -290,6 +306,121 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         s.push_str(&render_sheet(wb, a, si, o));
     }
     s
+}
+
+/// File-level settings that change how the workbook behaves or reads.
+fn workbook_settings(s: &mut String, wb: &Workbook) {
+    let mut lines = Vec::new();
+    if !wb.properties.is_empty() {
+        let props: Vec<String> = wb
+            .properties
+            .iter()
+            .filter(|(k, _)| !(k == "modified" && wb.source.modified.is_some()))
+            .map(|(k, v)| {
+                // ISO timestamps to the day.
+                let v = if matches!(k.as_str(), "created" | "modified") && v.len() > 10 && v.as_bytes()[4] == b'-' { &v[..10] } else { v };
+                format!("{k}: {}", trunc(v, 120))
+            })
+            .collect();
+        lines.push(format!("properties: {}", props.join(" · ")));
+    }
+    if let Some(c) = &wb.calc {
+        let mut t = format!("calculation: {}", c.mode);
+        if c.mode == "manual" {
+            t.push_str(" (stored values may be stale until recalculated)");
+        }
+        if c.iterative {
+            t.push_str(" · iterative: circular references allowed");
+            match (c.max_iterations, c.max_change) {
+                (Some(n), Some(d)) => {
+                    let _ = write!(t, ", up to {n} iterations or change < {d}");
+                }
+                (Some(n), None) => {
+                    let _ = write!(t, ", up to {n} iterations");
+                }
+                _ => {}
+            }
+        }
+        lines.push(t);
+    }
+    if wb.structure_locked {
+        lines.push("structure locked: sheets can't be added, deleted, renamed or unhidden".into());
+    }
+    if !lines.is_empty() {
+        let _ = writeln!(s, "{}", lines.join("\n"));
+    }
+}
+
+/// One line on what a script without procedures does: a Power Query's source.
+fn script_gist(sc: &crate::model::Script) -> String {
+    let src = sc.source.lines().map(str::trim).find(|l| l.starts_with("Source =") || l.starts_with("Source=")).unwrap_or("");
+    src.trim_start_matches("Source").trim_start().trim_start_matches('=').trim().trim_end_matches(',').to_string()
+}
+
+/// A cell's text with formatted runs marked: `Total [due]{bold fg#FF0000}`.
+pub fn runs_text(c: &Cell) -> String {
+    let mut out = String::new();
+    let mut last = String::new();
+    for r in &c.runs {
+        let d = font_desc(&r.f);
+        if d.is_empty() {
+            out.push_str(&r.text);
+        } else if d == last && out.ends_with('}') {
+            // Same emphasis as the run before: one bracket.
+            let at = out.rfind("]{").unwrap_or(out.len());
+            out.insert_str(at, &r.text);
+        } else {
+            let _ = write!(out, "[{}]{{{d}}}", r.text);
+        }
+        last = d;
+    }
+    out
+}
+
+/// Emphasis only: font and size changes are left to workbook.json.gz.
+fn font_desc(st: &Style) -> String {
+    let mut p = Vec::new();
+    for (on, name) in [(st.bold, "bold"), (st.italic, "italic"), (st.strike, "strike"), (st.underline, "underline")] {
+        if on {
+            p.push(name.to_string());
+        }
+    }
+    p.extend(st.fg.as_ref().map(|f| format!("fg{f}")));
+    p.join(" ")
+}
+
+/// Pictures in cells, data types and chips, by kind.
+fn cell_objects(s: &mut String, sh: &Sheet) {
+    let mut by: BTreeMap<&str, Vec<&Cell>> = BTreeMap::new();
+    for c in sh.cells.iter().filter(|c| c.obj.is_some()) {
+        by.entry(c.obj.as_ref().unwrap().kind.as_str()).or_default().push(c);
+    }
+    for (kind, cells) in by {
+        let label = match kind {
+            "image" => "pictures in cells",
+            "entity" => "data types (linked records)",
+            "person" => "people chips",
+            "file" => "file chips",
+            "link" => "link chips",
+            other => other,
+        };
+        let rects: Vec<Rect> = cover(cells.iter().map(|c| ((), c.r, c.c)).collect()).into_iter().map(|(_, r)| r).collect();
+        let examples: Vec<String> = cells
+            .iter()
+            .take(3)
+            .map(|c| {
+                let o = c.obj.as_ref().unwrap();
+                let mut e = format!("{} {}", crate::a1::cell_name(c.r, c.c), o.text.as_deref().map(|t| format!("\"{}\"", trunc(t, 40))).unwrap_or_default());
+                if !o.props.is_empty() {
+                    let props: Vec<String> = o.props.iter().take(5).map(|(k, v)| format!("{k}={}", trunc(v, 30))).collect();
+                    let _ = write!(e, " {{{}}}", props.join(", "));
+                }
+                e.trim_end().to_string()
+            })
+            .collect();
+        let place = if cells.len() > examples.len() { format!("{} · e.g. ", rect_list(&rects, 4)) } else { String::new() };
+        let _ = writeln!(s, "▣ {label} ({}): {place}{}", cells.len(), examples.join("; "));
+    }
 }
 
 // ---------------------------------------------------------------- sheet
@@ -324,7 +455,7 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
             k(e.cells)
         );
     }
-    if sa.used.is_none() && sh.charts.is_empty() {
+    if sa.used.is_none() && sh.charts.is_empty() && sh.shapes.is_empty() {
         return s;
     }
 
@@ -507,8 +638,59 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
             if p.filters.is_empty() { String::new() } else { format!(" filters[{}]", p.filters.join(",")) }
         ));
     }
+    for x in sh.shapes.iter().take(12) {
+        let mut t = x.kind.clone();
+        if let Some(txt) = &x.text {
+            let _ = write!(t, " \"{}\"", trunc(txt, 80));
+        } else if !x.name.is_empty() {
+            let _ = write!(t, " {}", x.name);
+        }
+        if let Some(r) = x.anchor {
+            let _ = write!(t, " at {r}");
+        }
+        if let Some(alt) = &x.alt {
+            let _ = write!(t, " — {}", trunc(alt, 80));
+        }
+        if let Some(m) = &x.on_click {
+            let _ = write!(t, " → runs {m}");
+        }
+        if let Some(l) = &x.linked_cell {
+            let _ = write!(t, " ⇄ {l}");
+        }
+        misc.push(t);
+    }
+    if sh.shapes.len() > 12 {
+        misc.push(format!("+{} more shapes", sh.shapes.len() - 12));
+    }
+    // Locking only matters under protection, but marks the intended inputs either way.
+    for (flag, label) in [(true, "unlocked cells (editable when the sheet is protected)"), (false, "formulas hidden when protected")] {
+        let pts: Vec<((), u32, u32)> = sh
+            .cells
+            .iter()
+            .filter(|c| c.s.is_some_and(|i| {
+                let st = &wb.styles[i as usize];
+                if flag { st.unlocked } else { st.hidden_formula }
+            }))
+            .map(|c| ((), c.r, c.c))
+            .collect();
+        if !pts.is_empty() {
+            let rects: Vec<Rect> = cover(pts).into_iter().map(|(_, r)| r).collect();
+            misc.push(format!("{label}: {}", rect_list(&rects, 6)));
+        }
+    }
     for m in misc {
         let _ = writeln!(s, "{m}");
+    }
+    cell_objects(&mut s, sh);
+    let rich: Vec<&Cell> = sh.cells.iter().filter(|c| !c.runs.is_empty()).collect();
+    if !rich.is_empty() {
+        let _ = writeln!(s, "✎ mixed formatting in text ({})", rich.len());
+        for c in rich.iter().take(8) {
+            let _ = writeln!(s, "{}: {}", crate::a1::cell_name(c.r, c.c), trunc(&runs_text(c), 160));
+        }
+        if rich.len() > 8 {
+            let _ = writeln!(s, "+{} more", rich.len() - 8);
+        }
     }
     let notes: Vec<&Cell> = sh.cells.iter().filter(|c| c.note.is_some()).collect();
     if !notes.is_empty() {

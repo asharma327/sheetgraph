@@ -42,6 +42,9 @@ Notation:
 - `▸ range table …` is a data block, one line per column: type and range, `enum` for small value sets, `fmt` for the number format, `ƒN` when computed.
 - `⋯ rows A–B summarized`: a very large sheet's middle rows are summarized per column, not kept.
 - Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`.
+- The lines under the title are file settings. `calculation: manual` means stored values may be stale; `iterative` means circular references are intended, not errors.
+- `▣` lines are pictures in cells and data types (stocks, places, people chips); `[image: …]` in a cell is a picture, not text. `✎ mixed formatting` shows runs as `[text]{bold fg#FF0000}`. `unlocked cells` are the inputs a protected sheet leaves editable.
+- Shape lines (`button "Run roll-up" at G9:H10 → runs RollUp`, `text box "…"`) are things drawn over the grid; text boxes often hold instructions.
 - Scripts: one line per macro with its trigger, what it `writes` and `uses`, and what it `calls`. `,…` means more cells whose address is built at run time; `(not in file)` is a sheet the macro creates. Values a macro writes are pasted values in the sheet, not formulas: check here before calling a number hardcoded.
 
 ## 4. Drill down for exact values (offline, fast)

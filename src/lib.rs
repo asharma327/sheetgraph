@@ -12,6 +12,7 @@ pub mod graph;
 pub mod gsheets;
 pub mod macros;
 pub mod model;
+pub mod numfmt;
 pub mod ooxml;
 pub mod query;
 pub mod report;

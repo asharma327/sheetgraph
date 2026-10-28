@@ -7,8 +7,9 @@
 //! failed extraction. Values and formulas still come from calamine.
 
 use crate::a1::{col_name, parse_pt, parse_rect, quote_sheet, Rect, OPEN};
-use crate::model::{
-    Cell, Chart, CondFormat, ExternalLink, Filter, Interner, Pivot, Protected, Sheet, Style, Table, Validation, Workbook,
+use crate::model::{fmt_num, Value, 
+    Calc, Cell, CellObject, Chart, CondFormat, Connection, ExternalLink, Filter, Interner, Pivot, Protected, Run, Script, Shape, Sheet, Style,
+    Table, Validation, Workbook,
 };
 use anyhow::{anyhow, Result};
 use quick_xml::events::{BytesRef, BytesStart, Event};
@@ -35,13 +36,22 @@ pub fn enrich(path: &Path, wb: &mut Workbook) -> Result<()> {
         styles.xfs.iter().map(|s| if *s == Style::default() { None } else { Some(interner.intern(s.clone())) }).collect();
     let mut dvs = Interner::<Validation>::default();
     let mut skipped: BTreeSet<&str> = BTreeSet::new();
+    let rich = part_of("sharedStrings").map(|p| rich_strings(&mut pkg, &p, &styles)).unwrap_or_default();
+    let objects = rich_values(&mut pkg);
 
     wb.external_links = external_links(&mut pkg, &root, &rels);
+    wb.calc = calc(&root);
+    wb.structure_locked = root.child("workbookProtection").is_some_and(|p| p.flag("lockStructure"));
+    wb.properties = properties(&mut pkg);
+    if let Some(p) = part_of("connections") {
+        wb.connections = connections(&mut pkg, &p);
+    }
+    wb.scripts.extend(power_query(&mut pkg));
 
     for s in root.child("sheets").map(|s| s.children("sheet").collect::<Vec<_>>()).unwrap_or_default() {
         let (Some(name), Some(rel)) = (s.attr("name"), s.attr("id").and_then(|id| rels.get(id))) else { continue };
         let Some(si) = wb.sheets.iter().position(|x| x.name == name) else { continue };
-        let mut cx = SheetCx { styles: &styles, xf_ids: &xf_ids, dvs: &mut dvs, skipped: &mut skipped };
+        let mut cx = SheetCx { styles: &styles, xf_ids: &xf_ids, dvs: &mut dvs, skipped: &mut skipped, rich: &rich, objects: &objects };
         if let Err(e) = read_sheet(&mut pkg, &rel.target, &rel.kind, &mut wb.sheets[si], &mut cx) {
             wb.warnings.push(format!("{name}: {e:#}"));
         }
@@ -69,7 +79,7 @@ pub fn enrich(path: &Path, wb: &mut Workbook) -> Result<()> {
         }
     }
 
-    for (prefix, what) in [("xl/media/", "images"), ("xl/slicers/", "slicers"), ("xl/timelines/", "timelines")] {
+    for (prefix, what) in [("xl/slicers/", "slicers"), ("xl/timelines/", "timelines"), ("xl/activex/", "ActiveX controls")] {
         if pkg.names.keys().any(|n| n.starts_with(prefix)) {
             skipped.insert(what);
         }
@@ -112,6 +122,13 @@ impl Pkg {
         c.expand_empty_elements = false;
         c.trim_text(false);
         Some(r)
+    }
+
+    fn bytes(&mut self, part: &str) -> Option<Vec<u8>> {
+        let name = self.names.get(&part.to_ascii_lowercase())?.clone();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut self.zip.by_name(&name).ok()?, &mut out).ok()?;
+        Some(out)
     }
 
     fn node(&mut self, part: &str) -> Option<Node> {
@@ -202,6 +219,14 @@ impl Node {
         walk(self, name, &mut out);
         out
     }
+    /// All text below, in document order.
+    fn all_text(&self) -> String {
+        let mut s = self.text.clone();
+        for k in &self.kids {
+            s.push_str(&k.all_text());
+        }
+        s
+    }
     /// Concatenated text of every `<t>` below (rich-text runs).
     fn runs(&self) -> String {
         self.all("t").iter().map(|t| t.text.as_str()).collect()
@@ -274,6 +299,10 @@ struct SheetCx<'a> {
     xf_ids: &'a [Option<u32>],
     dvs: &'a mut Interner<Validation>,
     skipped: &'a mut BTreeSet<&'static str>,
+    /// Shared strings with mixed formatting, by index.
+    rich: &'a HashMap<u32, Vec<Run>>,
+    /// Pictures and data types by cell `vm` (value metadata) index, from 0.
+    objects: &'a [Option<CellObject>],
 }
 
 /// One pass over a worksheet part: cell style ids and hidden rows are taken
@@ -288,10 +317,18 @@ struct SheetXml {
     shared_fixes: Vec<(u32, u32, String)>,
     /// Summarized rows ([`crate::model::Elided`]): their cell styles are skipped.
     gap: Option<(u32, u32)>,
+    /// Read shared-string indexes (only when some shared strings are rich).
+    want_sst: bool,
+    /// Cells holding a shared string: (row, col, index).
+    sst_cells: Vec<(u32, u32, u32)>,
+    /// Inline rich strings (`<is><r>…`).
+    inline: Vec<(u32, u32, Node)>,
+    /// Cells with value metadata (`vm`): pictures in cells, data types.
+    vm: Vec<(u32, u32, u32)>,
 }
 
-fn read_sheet_xml<R: BufRead>(rd: &mut Reader<R>, gap: Option<(u32, u32)>) -> Result<SheetXml> {
-    let mut out = SheetXml { gap, ..Default::default() };
+fn read_sheet_xml<R: BufRead>(rd: &mut Reader<R>, gap: Option<(u32, u32)>, want_sst: bool) -> Result<SheetXml> {
+    let mut out = SheetXml { gap, want_sst, ..Default::default() };
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -319,9 +356,23 @@ fn read_sheet_data<R: BufRead>(rd: &mut Reader<R>, out: &mut SheetXml, buf: &mut
     // `r` is optional on rows and cells; position then follows the previous one.
     let (mut row, mut next_col, mut started) = (0u32, 0u32, false);
     let (mut cell, mut masters) = ((0u32, 0u32), HashMap::new());
+    let mut shared_str = false;
     loop {
         buf.clear();
+        let kept = |out: &SheetXml, r: u32| !out.gap.is_some_and(|(a, b)| (a..=b).contains(&r));
         match rd.read_event_into(buf)? {
+            Event::Start(e) if e.local_name().as_ref() == "v" && shared_str && out.want_sst => {
+                let v = read_children(rd, "v".into(), Vec::new(), buf)?;
+                if let (Ok(i), true) = (v.text.trim().parse::<u32>(), kept(out, cell.0)) {
+                    out.sst_cells.push((cell.0, cell.1, i));
+                }
+            }
+            Event::Start(e) if e.local_name().as_ref() == "is" => {
+                let n = read_children(rd, "is".into(), Vec::new(), buf)?;
+                if n.child("r").is_some() && kept(out, cell.0) {
+                    out.inline.push((cell.0, cell.1, n));
+                }
+            }
             Event::Start(e) if e.local_name().as_ref() == "f" => {
                 let f = read_children(rd, "f".into(), attrs_of(&e), buf)?;
                 shared_formula(&f, cell, &mut masters, &mut out.shared_fixes);
@@ -348,17 +399,23 @@ fn read_sheet_data<R: BufRead>(rd: &mut Reader<R>, out: &mut SheetXml, buf: &mut
                     }
                 }
                 "c" => {
-                    let (mut pos, mut s) = (None, None);
+                    let (mut pos, mut s, mut vm) = (None, None, None);
+                    shared_str = false;
                     for a in e.attributes().flatten() {
                         match a.key.local_name().as_ref() {
                             "r" => pos = parse_pt(&a.value).and_then(|p| Some((p.row?, p.col?))),
                             "s" => s = a.value.parse::<u32>().ok(),
+                            "t" => shared_str = a.value.as_ref() == "s",
+                            "vm" => vm = a.value.parse::<u32>().ok(),
                             _ => {}
                         }
                     }
                     let (r, c) = pos.unwrap_or((row, next_col));
                     next_col = c + 1;
                     cell = (r, c);
+                    if let Some(vm) = vm.filter(|v| *v > 0) {
+                        out.vm.push((r, c, vm));
+                    }
                     if let Some(s) = s.filter(|s| *s != 0)
                         && !out.gap.is_some_and(|(a, b)| (a..=b).contains(&r))
                     {
@@ -409,7 +466,7 @@ fn push_span(spans: &mut Vec<(u32, u32)>, i: u32) {
 fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut SheetCx) -> Result<()> {
     let sx = {
         let mut rd = pkg.reader(part).ok_or_else(|| anyhow!("missing part {part}"))?;
-        read_sheet_xml(&mut rd, sh.elided.as_ref().map(|e| e.rows))?
+        read_sheet_xml(&mut rd, sh.elided.as_ref().map(|e| e.rows), !cx.rich.is_empty())?
     };
     let rels = pkg.rels(part);
     if kind == "chartsheet" {
@@ -426,7 +483,42 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
             && let Some(x) = cell_at(&mut sh.cells, &mut at, r, c)
         {
             x.s = Some(*id);
+            // Numbers as the format shows them (25%, $12.50); dates already are.
+            if let (Value::Num(n), None, Some(st)) = (&x.v, &x.t, cx.styles.xfs.get(xf as usize))
+                && !st.is_date()
+                && let Some(t) = st.num_fmt.as_deref().and_then(|code| crate::numfmt::format(*n, code))
+                && t != fmt_num(*n)
+            {
+                x.t = Some(t);
+            }
         }
+    }
+    for &(r, c, i) in &sx.sst_cells {
+        if let Some(runs) = cx.rich.get(&i)
+            && let Some(x) = cell_at(&mut sh.cells, &mut at, r, c)
+        {
+            x.runs = runs.clone();
+        }
+    }
+    for (r, c, n) in &sx.inline {
+        let runs = rich_runs(n, cx.styles);
+        if !runs.is_empty()
+            && let Some(x) = cell_at(&mut sh.cells, &mut at, *r, *c)
+        {
+            x.runs = runs;
+        }
+    }
+    for &(r, c, vm) in &sx.vm {
+        let Some(Some(o)) = cx.objects.get(vm as usize - 1) else { continue };
+        let Some(x) = cell_at(&mut sh.cells, &mut at, r, c) else { continue };
+        // The stored value of a picture or data type cell is #VALUE!.
+        if x.f.is_none() || matches!(x.v, Value::Err { .. }) {
+            x.v = match (&o.text, o.kind.as_str()) {
+                (Some(t), "entity") => Value::Str(t.clone()),
+                _ => Value::Empty,
+            };
+        }
+        x.obj = Some(o.clone());
     }
     for (r, c, f) in sx.shared_fixes {
         if let Some(x) = cell_at(&mut sh.cells, &mut at, r, c) {
@@ -514,6 +606,13 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
                 if let Some(rel) = n.attr("id").and_then(|id| rels.get(id)) {
                     let target = rel.target.clone();
                     sh.charts.extend(charts(pkg, &target));
+                    sh.shapes.extend(drawing_shapes(pkg, &target));
+                }
+            }
+            "legacyDrawing" => {
+                if let Some(rel) = n.attr("id").and_then(|id| rels.get(id)) {
+                    let target = rel.target.clone();
+                    sh.shapes.extend(form_controls(pkg, &target));
                 }
             }
             "extLst" => {
@@ -783,6 +882,263 @@ fn table(n: &Node) -> Option<Table> {
     })
 }
 
+// ---------------------------------------------------------------- rich text & rich values
+
+/// Shared strings whose runs are formatted differently, by index. Streams the
+/// part so a large plain string table costs nothing kept.
+fn rich_strings(pkg: &mut Pkg, part: &str, st: &Styles) -> HashMap<u32, Vec<Run>> {
+    match pkg.reader(part) {
+        Some(mut rd) => rich_string_table(&mut rd, st),
+        None => HashMap::new(),
+    }
+}
+
+fn rich_string_table<R: BufRead>(rd: &mut Reader<R>, st: &Styles) -> HashMap<u32, Vec<Run>> {
+    let mut out = HashMap::new();
+    let (mut buf, mut i) = (Vec::new(), 0u32);
+    loop {
+        buf.clear();
+        match rd.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == "si" => {
+                let Ok(n) = read_children(rd, "si".into(), Vec::new(), &mut buf) else { break };
+                if n.child("r").is_some() {
+                    let runs = rich_runs(&n, st);
+                    if !runs.is_empty() {
+                        out.insert(i, runs);
+                    }
+                }
+                i += 1;
+            }
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == "si" => i += 1,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Runs of an `<si>` / `<is>`, merged where formatting repeats; empty when
+/// every run looks the same.
+fn rich_runs(n: &Node, st: &Styles) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for k in &n.kids {
+        let (text, f) = match k.name.as_str() {
+            "t" => (k.text.clone(), Style::default()),
+            "r" => (k.children("t").map(|t| t.text.as_str()).collect(), k.child("rPr").map(|p| st.font_style(p)).unwrap_or_default()),
+            _ => continue,
+        };
+        match out.last_mut() {
+            Some(last) if last.f == f => last.text.push_str(&text),
+            _ if text.is_empty() => {}
+            _ => out.push(Run { text, f }),
+        }
+    }
+    if !crate::model::runs_differ(&out) {
+        out.clear();
+    }
+    out
+}
+
+/// A rich value's structure type and its (key, key type, value) fields.
+type RichFields<'a> = (&'a str, Vec<(&'a str, &'a str, &'a str)>);
+
+/// What each cell `vm` index points at: a picture placed in the cell or a
+/// linked data type. Follows metadata.xml → rich value → its structure (and,
+/// for pictures, richValueRel.xml → the image part).
+fn rich_values(pkg: &mut Pkg) -> Vec<Option<CellObject>> {
+    let Some(meta) = pkg.node("xl/metadata.xml") else { return Vec::new() };
+    let types: Vec<&str> = meta.child("metadataTypes").map(|t| t.children("metadataType").map(|m| m.attr("name").unwrap_or("")).collect()).unwrap_or_default();
+    let rv_index: Vec<Option<u32>> = meta
+        .children("futureMetadata")
+        .find(|f| f.attr("name") == Some("XLRICHVALUE"))
+        .map(|f| f.children("bk").map(|bk| bk.all("rvb").first().and_then(|r| r.num("i"))).collect())
+        .unwrap_or_default();
+    let structs: Vec<(String, Vec<(String, String)>)> = pkg
+        .node("xl/richData/rdrichvaluestructure.xml")
+        .map(|n| {
+            n.children("s")
+                .map(|s| {
+                    let keys = s.children("k").map(|k| (k.attr("n").unwrap_or("").to_string(), k.attr("t").unwrap_or("").to_string())).collect();
+                    (s.attr("t").unwrap_or("").to_string(), keys)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let values: Vec<(usize, Vec<String>)> = pkg
+        .node("xl/richData/rdrichvalue.xml")
+        .map(|n| n.children("rv").map(|rv| (rv.num("s").unwrap_or(0) as usize, rv.children("v").map(|v| v.text.clone()).collect())).collect())
+        .unwrap_or_default();
+    let rel_part = "xl/richData/richValueRel.xml";
+    let rels = pkg.rels(rel_part);
+    let images: Vec<Option<String>> = pkg
+        .node(rel_part)
+        .map(|n| n.children("rel").map(|r| r.attr("id").and_then(|id| rels.get(id)).map(|x| x.target.clone())).collect())
+        .unwrap_or_default();
+
+    // A rich value's fields by key name.
+    let fields = |i: usize| -> Option<RichFields<'_>> {
+        let (s, vs) = values.get(i)?;
+        let (t, keys) = structs.get(*s)?;
+        Some((t.as_str(), keys.iter().zip(vs).map(|((k, kt), v)| (k.as_str(), kt.as_str(), v.as_str())).collect()))
+    };
+    let object = |i: usize| -> Option<CellObject> {
+        let (t, kv) = fields(i)?;
+        let get = |name: &str| kv.iter().find(|(k, _, _)| *k == name).map(|(_, _, v)| v.to_string());
+        if t.to_ascii_lowercase().contains("image") {
+            let target = get("_rvRel:LocalImageIdentifier").and_then(|r| r.parse::<usize>().ok()).and_then(|r| images.get(r).cloned().flatten());
+            return Some(CellObject { kind: "image".into(), text: get("Text").filter(|t| !t.is_empty()), target, props: Vec::new() });
+        }
+        let display = get("_DisplayString")?;
+        let mut props = Vec::new();
+        for (k, kt, v) in &kv {
+            if k.starts_with('_') || k.starts_with('%') || props.len() >= 30 {
+                continue;
+            }
+            let v = match *kt {
+                "" | "s" | "b" | "d" => v.to_string(),
+                // Nested rich value: show its display name.
+                "r" => match v.parse::<usize>().ok().and_then(fields) {
+                    Some((_, nested)) => match nested.iter().find(|(k, _, _)| *k == "_DisplayString") {
+                        Some((_, _, d)) => d.to_string(),
+                        None => continue,
+                    },
+                    None => continue,
+                },
+                _ => continue,
+            };
+            props.push((k.to_string(), v));
+        }
+        Some(CellObject { kind: "entity".into(), text: Some(display), target: None, props })
+    };
+    meta.child("valueMetadata")
+        .map(|vm| {
+            vm.children("bk")
+                .map(|bk| {
+                    let rc = bk.child("rc")?;
+                    let ty = types.get(rc.num("t")?.checked_sub(1)? as usize)?;
+                    if *ty != "XLRICHVALUE" {
+                        return None;
+                    }
+                    object((*rv_index.get(rc.num("v")? as usize)?)? as usize)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------- shapes
+
+/// Pictures, shapes and text boxes on a drawing part (charts are read apart).
+fn drawing_shapes(pkg: &mut Pkg, drawing: &str) -> Vec<Shape> {
+    let Some(d) = pkg.node(drawing) else { return Vec::new() };
+    let mut out = Vec::new();
+    for a in d.kids.iter().filter(|k| k.name.ends_with("Anchor")) {
+        let rect = anchor_rect(a);
+        for k in &a.kids {
+            drawn(k, rect, &mut out);
+        }
+    }
+    out
+}
+
+fn drawn(k: &Node, anchor: Option<Rect>, out: &mut Vec<Shape>) {
+    let props = |nv: &str| k.child(nv).and_then(|n| n.child("cNvPr"));
+    let mut shape = |kind: &str, p: Option<&Node>, text: Option<String>| {
+        let alt = p.and_then(|p| p.attr("descr")).filter(|d| !d.is_empty()).map(String::from);
+        let on_click = k.attr("macro").and_then(macro_name);
+        if kind != "picture" && text.is_none() && on_click.is_none() && alt.is_none() {
+            return; // plain lines and boxes
+        }
+        out.push(Shape {
+            kind: kind.into(),
+            name: p.and_then(|p| p.attr("name")).unwrap_or("").into(),
+            anchor,
+            text,
+            alt,
+            on_click,
+            linked_cell: None,
+        });
+    };
+    match k.name.as_str() {
+        "pic" => shape("picture", props("nvPicPr"), None),
+        "sp" => {
+            let text_box = k.child("nvSpPr").and_then(|n| n.child("cNvSpPr")).is_some_and(|c| c.flag("txBox"));
+            let text = k.child("txBody").map(|b| b.children("p").map(|p| p.runs()).collect::<Vec<_>>().join("\n").trim().to_string()).filter(|t| !t.is_empty());
+            shape(if text_box { "text box" } else { "shape" }, props("nvSpPr"), text);
+        }
+        "grpSp" => {
+            for kid in &k.kids {
+                drawn(kid, anchor, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Cells a drawing anchor covers. An edge at offset 0 sits on the cell's
+/// border, so that row or column isn't covered.
+fn anchor_rect(a: &Node) -> Option<Rect> {
+    let pos = |n: &Node| -> Option<(u32, u32, bool)> {
+        let num = |k: &str| n.child(k)?.text.trim().parse::<u32>().ok();
+        Some((num("row")?, num("col")?, num("rowOff").unwrap_or(0) == 0 && num("colOff").unwrap_or(0) == 0))
+    };
+    let (r0, c0, _) = pos(a.child("from")?)?;
+    let (mut r1, mut c1) = (r0, c0);
+    if let Some((r, c, on_edge)) = a.child("to").and_then(pos) {
+        let back = |v: u32, start: u32| if on_edge && v > start { v - 1 } else { v };
+        (r1, c1) = (back(r, r0), back(c, c0));
+    }
+    Some(Rect::new(r0, c0, r1, c1))
+}
+
+/// `[0]!RollUp`, `'Book.xlsm'!Module1.RollUp` → `RollUp`, `Module1.RollUp`.
+fn macro_name(s: &str) -> Option<String> {
+    let s = s.trim().trim_start_matches('=');
+    let name = s.rsplit('!').next().unwrap_or(s).trim_matches('\'').trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Form controls (buttons, checkboxes, dropdowns) from a VML drawing.
+/// Comment boxes live there too and are skipped.
+fn form_controls(pkg: &mut Pkg, part: &str) -> Vec<Shape> {
+    let Some(n) = pkg.node(part) else { return Vec::new() };
+    let mut out = Vec::new();
+    for sh in n.all("shape") {
+        let Some(cd) = sh.child("ClientData") else { continue };
+        let kind = match cd.attr("ObjectType").unwrap_or("") {
+            "Note" => continue,
+            "Button" => "button",
+            "Checkbox" => "checkbox",
+            "Drop" => "dropdown",
+            "List" => "list box",
+            "Radio" => "option button",
+            "Spin" => "spinner",
+            "Scroll" => "scroll bar",
+            "GBox" => "group box",
+            "Label" => "label",
+            "Edit" => "edit box",
+            other => other,
+        }
+        .to_ascii_lowercase();
+        let text = sh.child("textbox").map(|t| t.all_text().trim().to_string()).filter(|t| !t.is_empty());
+        let anchor = cd.child("Anchor").and_then(|a| {
+            let v: Vec<u32> = a.text.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (v.len() == 8).then(|| Rect::new(v[2], v[0], v[6], v[4]))
+        });
+        let fmla = |k: &str| cd.child(k).map(|x| x.text.trim().to_string()).filter(|t| !t.is_empty());
+        out.push(Shape {
+            kind,
+            name: sh.attr("alt").unwrap_or("").into(),
+            anchor,
+            text,
+            alt: None,
+            on_click: fmla("FmlaMacro").as_deref().and_then(macro_name),
+            linked_cell: fmla("FmlaLink"),
+        });
+    }
+    out
+}
+
 // ---------------------------------------------------------------- charts & pivots
 
 /// Charts on a drawing part, in the order they're anchored.
@@ -877,6 +1233,204 @@ fn pivot(pkg: &mut Pkg, part: &str) -> Option<Pivot> {
             .unwrap_or_default(),
         filters: list("pageFields", "pageField", "fld"),
     })
+}
+
+// ---------------------------------------------------------------- workbook settings
+
+fn calc(root: &Node) -> Option<Calc> {
+    let c = root.child("calcPr")?;
+    let mode = match c.attr("calcMode") {
+        Some("manual") => "manual",
+        Some("autoNoTable") => "automatic except tables",
+        _ => "automatic",
+    };
+    let iterative = c.flag("iterate");
+    if !iterative && mode == "automatic" {
+        return None;
+    }
+    Some(Calc {
+        mode: mode.into(),
+        iterative,
+        max_iterations: iterative.then(|| c.num("iterateCount").unwrap_or(100)),
+        max_change: iterative.then(|| c.attr("iterateDelta").and_then(|d| d.parse().ok()).unwrap_or(0.001)),
+    })
+}
+
+/// Core, extended and custom document properties, in that order.
+fn properties(pkg: &mut Pkg) -> Vec<(String, String)> {
+    let rels = pkg.rels("");
+    let part = |kind: &str| rels.values().find(|r| r.kind == kind).map(|r| r.target.clone());
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut add = |k: &str, v: &str| {
+        let v = v.trim();
+        if !v.is_empty() {
+            out.push((k.to_string(), v.to_string()));
+        }
+    };
+    if let Some(n) = part("core-properties").and_then(|p| pkg.node(&p)) {
+        for (tag, name) in [
+            ("title", "title"),
+            ("subject", "subject"),
+            ("creator", "author"),
+            ("description", "description"),
+            ("keywords", "keywords"),
+            ("category", "category"),
+            ("contentStatus", "status"),
+            ("lastModifiedBy", "last modified by"),
+            ("created", "created"),
+            ("modified", "modified"),
+        ] {
+            if let Some(x) = n.child(tag) {
+                add(name, &x.text);
+            }
+        }
+    }
+    if let Some(n) = part("extended-properties").and_then(|p| pkg.node(&p)) {
+        for (tag, name) in [("Company", "company"), ("Manager", "manager")] {
+            if let Some(x) = n.child(tag) {
+                add(name, &x.text);
+            }
+        }
+    }
+    if let Some(n) = part("custom-properties").and_then(|p| pkg.node(&p)) {
+        for p in n.children("property") {
+            if let (Some(name), Some(v)) = (p.attr("name"), p.kids.first()) {
+                add(name, &v.text);
+            }
+        }
+    }
+    out
+}
+
+fn connections(pkg: &mut Pkg, part: &str) -> Vec<Connection> {
+    let Some(n) = pkg.node(part) else { return Vec::new() };
+    let mut out = Vec::new();
+    for c in n.children("connection") {
+        let mut x = Connection {
+            name: c.attr("name").unwrap_or("").into(),
+            description: c.attr("description").map(String::from),
+            refresh_on_open: c.flag("refreshOnLoad"),
+            kind: match c.attr("type") {
+                Some("1") => "odbc",
+                Some("2") => "dao",
+                Some("3") => "file",
+                Some("4") => "web",
+                Some("5") => "oledb",
+                Some("6") => "text",
+                Some("7") => "ado",
+                Some("8") => "dsp",
+                _ => "connection",
+            }
+            .into(),
+            ..Default::default()
+        };
+        if let Some(db) = c.child("dbPr") {
+            let conn = db.attr("connection").unwrap_or("");
+            // Power Query loads go through the Mashup provider; Location names the query.
+            if conn.contains("Microsoft.Mashup.OleDb") {
+                x.kind = "power query".into();
+                x.source = conn_field(conn, "location");
+            } else {
+                x.source = Some(scrub_secrets(conn)).filter(|s| !s.is_empty());
+            }
+            x.command = db.attr("command").map(String::from);
+        } else if let Some(w) = c.child("webPr") {
+            x.source = w.attr("url").map(String::from);
+        } else if let Some(t) = c.child("textPr") {
+            x.source = t.attr("sourceFile").map(String::from);
+        } else if let Some(o) = c.child("olapPr") {
+            x.kind = "olap".into();
+            x.source = o.attr("connection").map(scrub_secrets);
+        }
+        out.push(x);
+    }
+    out
+}
+
+fn conn_field(conn: &str, key: &str) -> Option<String> {
+    conn.split(';').find_map(|kv| kv.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case(key)).map(|(_, v)| v.trim().to_string()))
+}
+
+/// A connection string without its password.
+fn scrub_secrets(conn: &str) -> String {
+    conn.split(';')
+        .filter(|kv| {
+            let k = kv.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+            !matches!(k.as_str(), "pwd" | "password" | "jet oledb:database password")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Power Query (M) code: base64 in a `customXml` part, holding a zip with
+/// `Formulas/Section1.m`. One script per query.
+fn power_query(pkg: &mut Pkg) -> Vec<Script> {
+    let items: Vec<String> = pkg.names.keys().filter(|n| n.starts_with("customxml/item") && !n.contains("props")).cloned().collect();
+    for item in items {
+        let Some(raw) = pkg.bytes(&item) else { continue };
+        // Excel writes this part as UTF-16.
+        let text = match raw.as_slice() {
+            [0xFF, 0xFE, rest @ ..] => String::from_utf16_lossy(&rest.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>()),
+            _ => String::from_utf8_lossy(&raw).into_owned(),
+        };
+        let Some(start) = text.find("<DataMashup") else { continue };
+        let Some(body) = text[start..].split_once('>').and_then(|(_, b)| b.split("</DataMashup").next()) else { continue };
+        let Some(bin) = base64(body) else { continue };
+        if let Some(m) = mashup_section(&bin) {
+            return m_queries(&m);
+        }
+    }
+    Vec::new()
+}
+
+fn mashup_section(bin: &[u8]) -> Option<String> {
+    let len = u32::from_le_bytes(bin.get(4..8)?.try_into().ok()?) as usize;
+    let zip = bin.get(8..8 + len)?;
+    let mut z = ZipArchive::new(std::io::Cursor::new(zip)).ok()?;
+    let mut f = z.by_name("Formulas/Section1.m").ok()?;
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut f, &mut s).ok()?;
+    Some(s)
+}
+
+/// `shared Name = let … in …;` statements of a section document.
+fn m_queries(section: &str) -> Vec<Script> {
+    let mut out = Vec::new();
+    let starts: Vec<usize> = section.match_indices("shared ").map(|(i, _)| i).filter(|&i| i == 0 || section[..i].ends_with(['\n', ';', ' '])).collect();
+    for (k, &i) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(section.len());
+        let stmt = section[i + 7..end].trim();
+        let Some((name, body)) = stmt.split_once('=') else { continue };
+        let name = name.trim();
+        let name = name.strip_prefix("#\"").and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+        out.push(Script { kind: "power_query".into(), name: name.to_string(), source: body.trim().trim_end_matches(';').trim_end().to_string() });
+    }
+    out
+}
+
+fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for b in s.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------- external links
@@ -1026,6 +1580,8 @@ struct Styles {
     dxfs: Vec<String>,
     colors: Colors,
     fmts: HashMap<u32, String>,
+    /// The workbook's default font name and size, left out of styles.
+    def_font: (Option<String>, Option<String>),
 }
 
 impl Styles {
@@ -1048,30 +1604,43 @@ impl Styles {
         let val = |f: Option<&Node>, k: &str| f.and_then(|f| f.child(k)).and_then(|x| x.attr("val")).map(String::from);
         let (def_name, def_size) = (val(fonts.first().copied(), "name"), val(fonts.first().copied(), "sz"));
 
-        let mut st = Styles { xfs: Vec::new(), dxfs: Vec::new(), colors, fmts };
+        let mut st = Styles { xfs: Vec::new(), dxfs: Vec::new(), colors, fmts, def_font: (def_name.clone(), def_size.clone()) };
         for xf in list("cellXfs", "xf") {
             let id = |k: &str| xf.num(k).unwrap_or(0) as usize;
             let font = fonts.get(id("fontId")).copied();
             let num_fmt = st.fmts.get(&(id("numFmtId") as u32)).filter(|c| !c.eq_ignore_ascii_case("general")).cloned();
             let align = xf.child("alignment");
+            let prot = xf.child("protection");
             st.xfs.push(Style {
                 num_type: num_fmt.as_deref().and_then(num_type).map(String::from),
                 num_fmt,
                 bg: fills.get(id("fillId")).and_then(|f| st.fill_color(f)).filter(|c| c != "#FFFFFF"),
-                fg: font.and_then(|f| f.child("color")).and_then(|c| st.colors.of(c)).filter(|c| c != "#000000"),
-                bold: font.is_some_and(|f| on(f, "b")),
-                italic: font.is_some_and(|f| on(f, "i")),
-                strike: font.is_some_and(|f| on(f, "strike")),
-                underline: font.is_some_and(|f| on(f, "u")),
                 borders: borders.get(id("borderId")).is_some_and(|b| b.kids.iter().any(|s| s.attr("style").is_some_and(|v| v != "none"))),
                 h_align: align.and_then(|a| a.attr("horizontal")).filter(|h| !matches!(*h, "general" | "left")).map(|h| h.to_ascii_uppercase()),
-                font: val(font, "name").filter(|f| Some(f) != def_name.as_ref()),
-                size: val(font, "sz").filter(|s| Some(s) != def_size.as_ref()).and_then(|s| s.parse::<f64>().ok()).map(|s| s.round() as u32),
                 wrap: align.is_some_and(|a| a.flag("wrapText")),
+                // Cells are locked unless `locked="0"`; formulas show unless `hidden="1"`.
+                unlocked: prot.is_some_and(|p| matches!(p.attr("locked"), Some("0" | "false"))),
+                hidden_formula: prot.is_some_and(|p| p.flag("hidden")),
+                ..font.map(|f| st.font_style(f)).unwrap_or_default()
             });
         }
         st.dxfs = list("dxfs", "dxf").into_iter().map(|d| st.dxf_brief(d)).collect();
         st
+    }
+
+    /// The font part of a style, from a `<font>` or a rich-text run's `<rPr>`.
+    fn font_style(&self, f: &Node) -> Style {
+        let val = |k: &str| f.child(k).and_then(|x| x.attr("val")).map(String::from);
+        Style {
+            fg: f.child("color").and_then(|c| self.colors.of(c)).filter(|c| c != "#000000"),
+            bold: on(f, "b"),
+            italic: on(f, "i"),
+            strike: on(f, "strike"),
+            underline: on(f, "u"),
+            font: val("name").or_else(|| val("rFont")).filter(|n| Some(n) != self.def_font.0.as_ref()),
+            size: val("sz").filter(|s| Some(s) != self.def_font.1.as_ref()).and_then(|s| s.parse::<f64>().ok()).map(|s| s.round() as u32),
+            ..Default::default()
+        }
     }
 
     fn fill_color(&self, fill: &Node) -> Option<String> {
@@ -1347,10 +1916,26 @@ mod tests {
                 <row r="9"><c r="O9"><f t="shared" si="1"/></c></row></sheetData></worksheet>"#
             )
         };
-        let fixes = |range: &str| read_sheet_xml(&mut Reader::from_str(&sheet(range)), None).unwrap().shared_fixes;
+        let fixes = |range: &str| read_sheet_xml(&mut Reader::from_str(&sheet(range)), None, false).unwrap().shared_fixes;
         assert_eq!(fixes("O6:O9"), [(7, 14, "=SUM(C8:N8)".to_string()), (8, 14, "=SUM(C9:N9)".to_string())]);
         // The usual layout, which calamine already gets right, is left alone.
         assert!(fixes("O7:O9").is_empty());
+    }
+
+    #[test]
+    fn rich_shared_strings() {
+        let st = Styles::parse(&Node::default(), default_theme());
+        let sst = r#"<sst><si><t>plain</t></si><si><r><t xml:space="preserve">Net </t></r><r><rPr><b/><color rgb="FFFF0000"/><rFont val="Arial"/></rPr><t>loss</t></r></si><si/><si><r><rPr><i/></rPr><t>all</t></r><r><rPr><i/></rPr><t> italic</t></r></si></sst>"#;
+        let rich = rich_string_table(&mut Reader::from_str(sst), &st);
+        assert_eq!(rich.keys().collect::<Vec<_>>(), [&1], "only mixed formatting is kept");
+        let runs = &rich[&1];
+        assert_eq!((runs[0].text.as_str(), runs[0].f.is_plain()), ("Net ", true));
+        assert_eq!((runs[1].text.as_str(), runs[1].f.bold, runs[1].f.fg.as_deref(), runs[1].f.font.as_deref()), ("loss", true, Some("#FF0000"), Some("Arial")));
+
+        let sheet = r#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>1</v></c><c r="B1" t="s"><v>0</v></c><c r="C1" t="e" vm="2"><v>#VALUE!</v></c><c r="D1"><v>3</v></c></row></sheetData></worksheet>"#;
+        let sx = read_sheet_xml(&mut Reader::from_str(sheet), None, true).unwrap();
+        assert_eq!(sx.sst_cells, [(0, 0, 1), (0, 1, 0)]);
+        assert_eq!(sx.vm, [(0, 2, 2)]);
     }
 
     #[test]

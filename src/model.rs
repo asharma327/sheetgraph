@@ -24,6 +24,18 @@ pub struct Workbook {
     /// name them as `'[file]Sheet'!A1`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_links: Vec<ExternalLink>,
+    /// Document properties: title, author, description, … then custom ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<(String, String)>,
+    /// Calculation settings, when not the default (automatic, no iteration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calc: Option<Calc>,
+    /// Sheets can't be added, removed, renamed or unhidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structure_locked: bool,
+    /// Data connections: databases, web queries, text imports, Power Query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<Connection>,
     /// Anything the backend could not extract, so consumers know what is missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -93,6 +105,9 @@ pub struct Sheet {
     /// Excel tables (ListObjects); formulas reach them as `Name[Column]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<Table>,
+    /// Pictures, shapes, text boxes and form controls placed over the grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<Shape>,
     /// Rows summarized instead of kept, when the workbook was too big to hold
     /// whole (see [`crate::xlsx::CELL_BUDGET`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,19 +201,64 @@ pub struct Cell {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// Text whose formatting changes partway (one word bold, say), as runs.
+    /// Only kept when the runs differ from each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Run>,
+    /// A picture in the cell, or a data type (stock, place, person chip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obj: Option<CellObject>,
 }
 
 impl Cell {
     pub fn is_blank(&self) -> bool {
-        self.v.is_empty() && self.f.is_none()
+        self.v.is_empty() && self.f.is_none() && self.obj.is_none()
     }
     /// What a person would see in the cell.
     pub fn display(&self) -> String {
-        match &self.t {
-            Some(t) => t.clone(),
-            None => self.v.to_string(),
+        match (&self.t, &self.obj) {
+            (Some(t), _) => t.clone(),
+            (None, Some(o)) if self.v.is_empty() => match &o.text {
+                Some(t) => format!("[{}: {t}]", o.kind),
+                None => format!("[{}]", o.kind),
+            },
+            _ => self.v.to_string(),
         }
     }
+}
+
+/// A stretch of a cell's text with its own formatting (only the font
+/// properties of [`Style`] are used).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Run {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Style::is_plain")]
+    pub f: Style,
+}
+
+/// Whether runs differ in emphasis (bold, italic, underline, strike, colour).
+/// Runs that only switch font or size are mostly font fallback for another
+/// script, and aren't worth keeping.
+pub fn runs_differ(runs: &[Run]) -> bool {
+    let key = |r: &Run| (r.f.bold, r.f.italic, r.f.underline, r.f.strike, r.f.fg.clone());
+    runs.iter().any(|r| key(r) != key(&runs[0]))
+}
+
+/// What a cell holds besides a plain value.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CellObject {
+    /// "image" (a picture in the cell), "entity" (Excel linked data type such
+    /// as Stocks or Geography), "person", "file", "link" (Google smart chips).
+    pub kind: String,
+    /// Alt text of a picture, or the data type's display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Picture file inside the package, or a chip's URL / email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// A data type's fields (`Price = 412.5`, `Population = 67750000`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -269,9 +329,19 @@ pub struct Style {
     pub size: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub wrap: bool,
+    /// Left editable when the sheet is protected (cells are locked by default).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unlocked: bool,
+    /// The formula is hidden from the formula bar when the sheet is protected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden_formula: bool,
 }
 
 impl Style {
+    pub fn is_plain(&self) -> bool {
+        *self == Style::default()
+    }
+
     pub fn is_date(&self) -> bool {
         matches!(self.num_type.as_deref(), Some("DATE" | "DATE_TIME" | "TIME"))
     }
@@ -369,9 +439,66 @@ pub struct ExternalLink {
     pub sheets: Vec<String>,
 }
 
+/// How the workbook recalculates.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Calc {
+    /// "automatic", "manual", "automatic except tables" (Excel); "on change",
+    /// "on change and every minute", "on change and every hour" (Google).
+    pub mode: String,
+    /// Circular references are allowed and iterated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub iterative: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_change: Option<f64>,
+}
+
+/// A data connection the workbook refreshes from.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Connection {
+    pub name: String,
+    /// "odbc", "oledb", "web", "text", "power query", …
+    pub kind: String,
+    /// Connection string or URL, with passwords removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// SQL, table name or query run on the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub refresh_on_open: bool,
+}
+
+/// Something drawn over the grid.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Shape {
+    /// "picture", "shape", "text box", "button", "checkbox", "dropdown", …
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Cells it covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Rect>,
+    /// Text shown on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Alt text (descriptions of pictures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    /// Macro run when it's clicked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_click: Option<String>,
+    /// Cell a form control reads and writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_cell: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Script {
-    /// "vba" | "apps_script" | "macro"
+    /// "vba" | "apps_script" | "power_query"
     pub kind: String,
     pub name: String,
     pub source: String,

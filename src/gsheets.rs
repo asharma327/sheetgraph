@@ -5,7 +5,7 @@ use crate::a1::{col_name, quote_sheet, Rect, OPEN};
 use crate::model::*;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
-use serde_json::Value as J;
+use serde_json::{json, Value as J};
 use std::collections::HashMap;
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
@@ -172,6 +172,8 @@ struct CellData {
     effective_value: Option<ExtValue>,
     formatted_value: Option<String>,
     user_entered_format: Option<J>,
+    text_format_runs: Vec<J>,
+    chip_runs: Vec<J>,
     data_validation: Option<J>,
     note: Option<String>,
     hyperlink: Option<String>,
@@ -226,7 +228,7 @@ impl ExtValue {
 
 pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
     let id = crate::formula::spreadsheet_id(id_or_url);
-    let meta_fields = "spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone),namedRanges,dataSources,developerMetadata,\
+    let meta_fields = "spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone,autoRecalc,iterativeCalculationSettings),namedRanges,dataSources,developerMetadata,\
         sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata)";
     let meta: J = serde_json::from_str(&auth.get(&format!("{SHEETS}/{id}"), &[("fields", meta_fields)])?)?;
 
@@ -242,6 +244,7 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
         },
         ..Default::default()
     };
+    wb.calc = calc(&meta["properties"]);
     // Drive metadata is best-effort: needs the drive scope and visibility.
     match auth.get(
         &format!("https://www.googleapis.com/drive/v3/files/{id}"),
@@ -337,7 +340,8 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
     }
     let total = jobs.len();
     let fields = "sheets(data(startRow,startColumn,rowMetadata(hiddenByUser),columnMetadata(hiddenByUser),\
-        rowData(values(userEnteredValue,effectiveValue,formattedValue,userEnteredFormat,dataValidation,note,hyperlink,pivotTable))))";
+        rowData(values(userEnteredValue,effectiveValue,formattedValue,userEnteredFormat,dataValidation,note,hyperlink,pivotTable,\
+        textFormatRuns,chipRuns))))";
     let names: Vec<(String, u32)> = wb.sheets.iter().map(|s| (s.name.clone(), s.grid_cols)).collect();
     let queue = Mutex::new(jobs.into_iter());
     let (tx, rx) = mpsc::channel::<Result<(usize, u32, GridData)>>();
@@ -454,7 +458,13 @@ fn absorb(
             };
             let s = cd.user_entered_format.as_ref().map(style_of).filter(|s| *s != Style::default()).map(|s| styles.intern(s));
             let dv = cd.data_validation.as_ref().map(|d| dvs.intern(validation(d)));
-            let cell = Cell { r, c, v, f, t, s, dv, note: cd.note, link: cd.hyperlink };
+            let text = cd.formatted_value.as_deref().or(match &v {
+                Value::Str(s) => Some(s.as_str()),
+                _ => None,
+            });
+            let runs = text.map(|t| runs(t, &cd.text_format_runs)).unwrap_or_default();
+            let obj = chip(text, &cd.chip_runs);
+            let cell = Cell { r, c, v, f, t, s, dv, note: cd.note, link: cd.hyperlink, runs, obj };
             if cell.is_blank() && cell.s.is_none() && cell.dv.is_none() && cell.note.is_none() {
                 continue;
             }
@@ -545,7 +555,63 @@ fn style_of(f: &J) -> Style {
         font,
         size,
         wrap: f["wrapStrategy"].as_str() == Some("WRAP"),
+        ..Default::default()
     }
+}
+
+/// Recalculation settings, when they differ from Google's default (on change, no iteration).
+fn calc(p: &J) -> Option<Calc> {
+    let mode = match p["autoRecalc"].as_str() {
+        Some("MINUTE") => "on change and every minute",
+        Some("HOUR") => "on change and every hour",
+        _ => "on change",
+    };
+    let it = &p["iterativeCalculationSettings"];
+    let iterative = it.is_object();
+    if !iterative && mode == "on change" {
+        return None;
+    }
+    Some(Calc {
+        mode: mode.into(),
+        iterative,
+        max_iterations: it["maxIterations"].as_u64().map(|n| n as u32),
+        max_change: it["convergenceThreshold"].as_f64(),
+    })
+}
+
+/// A cell's text split where its formatting changes (`textFormatRuns`).
+/// Indexes count UTF-16 code units.
+fn runs(text: &str, fmt_runs: &[J]) -> Vec<Run> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut out: Vec<Run> = Vec::new();
+    for (i, r) in fmt_runs.iter().enumerate() {
+        let start = r["startIndex"].as_u64().unwrap_or(0) as usize;
+        let end = fmt_runs.get(i + 1).and_then(|n| n["startIndex"].as_u64()).map_or(units.len(), |e| e as usize);
+        let Some(slice) = units.get(start.min(units.len())..end.min(units.len())).filter(|s| !s.is_empty()) else { continue };
+        let f = style_of(&json!({ "textFormat": r["format"] }));
+        out.push(Run { text: String::from_utf16_lossy(slice), f });
+    }
+    if !runs_differ(&out) {
+        return Vec::new();
+    }
+    out
+}
+
+/// Smart chips: people, Drive files and other links.
+fn chip(text: Option<&str>, chips: &[J]) -> Option<CellObject> {
+    let mut objs = chips.iter().filter_map(|c| {
+        let c = &c["chip"];
+        let (kind, target) = if let Some(email) = c["personProperties"]["email"].as_str() {
+            ("person", email)
+        } else {
+            let uri = c["richLinkProperties"]["uri"].as_str()?;
+            (if uri.contains("docs.google.com") || uri.contains("drive.google.com") { "file" } else { "link" }, uri)
+        };
+        Some((kind, target.to_string()))
+    });
+    let (kind, target) = objs.next()?;
+    let props = objs.map(|(k, t)| (k.to_string(), t)).collect();
+    Some(CellObject { kind: kind.into(), text: text.map(Into::into), target: Some(target), props })
 }
 
 fn cond_values(cond: &J) -> Vec<String> {
@@ -685,5 +751,36 @@ fn pivot(p: &J, anchor: (u32, u32), id_to_name: &HashMap<i64, String>) -> Pivot 
             })
             .collect(),
         filters: arr(&p["filterSpecs"]).iter().map(col).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_runs_and_chips() {
+        // Shapes as the Sheets API returns them; indexes are UTF-16 units.
+        let fmt = json!([
+            {"startIndex": 0, "format": {}},
+            {"startIndex": 6, "format": {"bold": true, "foregroundColorStyle": {"rgbColor": {"red": 1}}}},
+        ]);
+        let r = runs("Café: due", fmt.as_array().unwrap());
+        assert_eq!(r.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["Café: ", "due"]);
+        assert!(r[1].f.bold && r[1].f.fg.as_deref() == Some("#FF0000"));
+        let same = json!([{"startIndex": 0, "format": {"italic": true}}, {"startIndex": 2, "format": {"italic": true}}]);
+        assert!(runs("abcd", same.as_array().unwrap()).is_empty());
+
+        let chips = json!([
+            {"startIndex": 0, "chip": {"personProperties": {"email": "ana@example.com", "displayFormat": "DEFAULT"}}},
+            {"startIndex": 4, "chip": {"richLinkProperties": {"uri": "https://docs.google.com/document/d/abc", "mimeType": "application/vnd.google-apps.document"}}},
+        ]);
+        let o = chip(Some("Ana and the plan"), chips.as_array().unwrap()).unwrap();
+        assert_eq!((o.kind.as_str(), o.target.as_deref()), ("person", Some("ana@example.com")));
+        assert_eq!(o.props, [("file".to_string(), "https://docs.google.com/document/d/abc".to_string())]);
+
+        assert_eq!(calc(&json!({"autoRecalc": "ON_CHANGE"})), None);
+        let c = calc(&json!({"autoRecalc": "HOUR", "iterativeCalculationSettings": {"maxIterations": 50, "convergenceThreshold": 0.01}})).unwrap();
+        assert_eq!((c.mode.as_str(), c.iterative, c.max_iterations, c.max_change), ("on change and every hour", true, Some(50), Some(0.01)));
     }
 }

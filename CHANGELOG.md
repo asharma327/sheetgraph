@@ -19,6 +19,26 @@ All notable changes to this project are documented here. The format follows
 - `sheetgraph macro <dir> [name]` lists macros or prints one module's or procedure's code; `find` also searches
   macro code.
 - Sheets' VBA code names are read from xlsx/xlsm (`Sheet.code_name`).
+- File-level settings: document and custom properties, calculation mode and iterative calculation (Excel and
+  Google), and whether the sheet structure is locked, at the top of REPORT.md.
+- Data connections (ODBC, OLE DB, web, text, Power Query) with passwords removed, and Power Query (M) code as
+  `power_query` scripts that `macro` and `find` read.
+- Pictures, shapes, text boxes and form controls over the grid (`Sheet.shapes`), with their text, alt text, the macro
+  a button runs and a control's linked cell; graph.json gets `shape` nodes with `runs` and `writes` edges.
+- Pictures placed in cells and Excel data types (Stocks, Geography) with their fields (`Cell.obj`); Google people and
+  file chips the same way.
+- Text with mixed formatting inside a cell (`Cell.runs`), from Excel and Google (`textFormatRuns`).
+- Locked/unlocked cells and hidden formulas (`Style.unlocked`, `Style.hidden_formula`), listed per sheet as the
+  inputs left editable under protection.
+- Numbers in xlsx/xlsm show as their format displays them (`25%`, `$12.50`, `(1,234)`), not only dates.
+- `tests/fixtures/audit.xlsx` and `tests/audit.rs`: one workbook with every item on the coverage checklist.
+
+### Fixed
+
+- A reference across sheets (`=SUM(Jan:Dec!B2)`) linked only the last sheet; it now links every sheet in the span.
+- A reference to another workbook (`'[Other.xlsx]Data'!A1`) also produced a broken `reads` edge in graph.json.
+- An xlsm whose VBA uses compression calamine doesn't expect no longer aborts the extraction; the macros are reported
+  missing and everything else is kept.
 
 ### Changed
 

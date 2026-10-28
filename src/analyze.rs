@@ -173,6 +173,18 @@ pub fn sheet_index(wb: &Workbook, name: &str) -> Option<usize> {
     })
 }
 
+/// Sheets a reference's sheet part covers: the one sheet, or every sheet from
+/// first to last (in tab order) for a 3D ref like `Jan:Dec`. Empty if unknown.
+pub fn sheet_span(wb: &Workbook, name: &str) -> Vec<usize> {
+    if let Some(i) = sheet_index(wb, name) {
+        return vec![i];
+    }
+    match name.split_once(':').map(|(a, b)| (sheet_index(wb, a), sheet_index(wb, b))) {
+        Some((Some(x), Some(y))) => (x.min(y)..=x.max(y)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Index of the cell at (r, c) in a sheet's sorted cell list.
 pub fn find_cell(sh: &Sheet, r: u32, c: u32) -> Option<&Cell> {
     sh.cells.binary_search_by_key(&(r, c), |x| (x.r, x.c)).ok().map(|i| &sh.cells[i])
@@ -335,11 +347,18 @@ fn resolve_refs(wb: &Workbook, si: usize, lx: &Lexed, rect: &Rect, a: &Analysis)
     let mut out = Vec::new();
     for t in &lx.refs {
         let (Some(a0), Some(a1)) = (t.rect_at(0, 0), t.rect_at(dr, dc)) else { continue };
-        let (sheet, sheet_name) = match &t.sheet {
-            None => (Some(si), None),
-            Some(n) => (sheet_index(wb, n), Some(n.clone())),
+        let rect = a0.union(&a1);
+        let Some(n) = &t.sheet else {
+            out.push(GRef { sheet: Some(si), sheet_name: None, rect, via_name: None });
+            continue;
         };
-        out.push(GRef { sheet, sheet_name, rect: a0.union(&a1), via_name: None });
+        let span = sheet_span(wb, n);
+        if span.is_empty() {
+            out.push(GRef { sheet: None, sheet_name: Some(n.clone()), rect, via_name: None });
+        }
+        for s in span {
+            out.push(GRef { sheet: Some(s), sheet_name: Some(n.clone()), rect, via_name: None });
+        }
     }
     for n in &lx.names {
         if let Some((sh, r)) = a.named.get(&n.to_ascii_uppercase()) {

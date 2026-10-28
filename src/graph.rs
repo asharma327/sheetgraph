@@ -54,6 +54,10 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
                     _ => r.rect.a1(),
                 };
                 let Some(t) = r.sheet else {
+                    // `[Book.xlsx]Sheet` refs are `imports` edges to the external node.
+                    if r.sheet_name.as_deref().is_some_and(|n| n.starts_with('[')) {
+                        continue;
+                    }
                     edges.push(json!({"from": group_id(si, gi), "to": null, "kind": "reads", "range": range_txt, "broken": true}));
                     continue;
                 };
@@ -72,6 +76,22 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
             nodes.push(json!({"id": id, "type": "chart", "sheet": format!("s{}", si + 1), "kind": ch.kind, "title": ch.title}));
             for src in &ch.sources {
                 link_a1(wb, a, &id, src, "plots", &mut edges);
+            }
+        }
+        for (xi, x) in sh.shapes.iter().enumerate().filter(|(_, x)| x.on_click.is_some() || x.linked_cell.is_some()) {
+            let id = format!("s{}.shape{}", si + 1, xi + 1);
+            nodes.push(json!({
+                "id": id, "type": "shape", "sheet": format!("s{}", si + 1), "kind": x.kind, "text": x.text,
+                "range": x.anchor.map(|r| r.a1()),
+            }));
+            if let Some(m) = &x.on_click {
+                for p in a.macros.iter().filter(|p| crate::macros::clicks(m, wb, p)) {
+                    edges.push(json!({"from": id, "to": macro_id(wb, p), "kind": "runs"}));
+                }
+            }
+            if let Some(cell) = &x.linked_cell {
+                let a1 = if cell.contains('!') { cell.clone() } else { format!("{}!{cell}", quote_sheet(&sh.name)) };
+                link_a1(wb, a, &id, &a1, "writes", &mut edges);
             }
         }
         for p in &sh.pivots {

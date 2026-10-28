@@ -74,7 +74,7 @@ fn k(n: u64) -> String {
     }
 }
 
-/// Rough token estimate: ~4 chars/token for ASCII, ~1 token/char otherwise (Thai, CJK).
+/// Rough token estimate: ~4 chars/token for ASCII, ~1 token/char for non-Latin scripts.
 pub fn approx_tokens(s: &str) -> usize {
     let (mut ascii, mut other) = (0usize, 0usize);
     for ch in s.chars() {

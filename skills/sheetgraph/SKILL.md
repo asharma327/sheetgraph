@@ -16,10 +16,10 @@ sheetgraph --version
 If that fails, install it (macOS/Linux), then retry:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asharma327/spreadsheet-extractor/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/asharma327/sheetgraph/main/install.sh | sh
 ```
 
-It installs to `~/.local/bin`; call it as `~/.local/bin/sheetgraph` if that isn't on PATH. With Rust: `cargo install --git https://github.com/asharma327/spreadsheet-extractor`. On Windows, download the zip from https://github.com/asharma327/spreadsheet-extractor/releases/latest.
+It installs to `~/.local/bin`; call it as `~/.local/bin/sheetgraph` if that isn't on PATH. With Rust: `cargo install --git https://github.com/asharma327/sheetgraph`. On Windows, download the zip from https://github.com/asharma327/sheetgraph/releases/latest.
 
 ## 2. Extract
 

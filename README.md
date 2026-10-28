@@ -2,7 +2,7 @@
 
 **Turn any spreadsheet into a map an LLM can read in one pass.**
 
-![A 141,000-cell job tracker (≈961k tokens) becomes a 940-token REPORT.md that still shows every formula, lookup and typed-over value](https://raw.githubusercontent.com/asharma327/spreadsheet-extractor/main/assets/demo.png)
+![A 141,000-cell job tracker (≈961k tokens) becomes a 940-token REPORT.md that still shows every formula, lookup and typed-over value](https://raw.githubusercontent.com/asharma327/sheetgraph/main/assets/demo.png)
 
 sheetgraph extracts Excel and Google Sheets (xlsx, xlsm, xls, xlsb, ods, csv) into a short `REPORT.md` plus a **formula dependency graph**, and saves every cell alongside them so an agent can look up exact values when it needs to.
 
@@ -18,12 +18,12 @@ Made by [Love Spreadsheets](https://lovespreadsheets.com), which turns Google Sh
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asharma327/spreadsheet-extractor/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/asharma327/sheetgraph/main/install.sh | sh
 ```
 
-Windows: download `sheetgraph-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/asharma327/spreadsheet-extractor/releases/latest).
+Windows: download `sheetgraph-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/asharma327/sheetgraph/releases/latest).
 
-With Rust 1.88 or newer: `cargo install --git https://github.com/asharma327/spreadsheet-extractor`.
+With Rust 1.88 or newer: `cargo install --git https://github.com/asharma327/sheetgraph`.
 
 ## Use it with your AI agent
 
@@ -32,7 +32,7 @@ sheetgraph ships as an agent skill, so your agent runs it on its own whenever yo
 **Claude Code:**
 
 ```
-/plugin install sheetgraph --marketplace asharma327/spreadsheet-extractor
+/plugin install sheetgraph --marketplace asharma327/sheetgraph
 ```
 
 **Codex, Cursor and other agents:** copy [`skills/sheetgraph/SKILL.md`](skills/sheetgraph/SKILL.md) into your agent's skills folder, or paste it into your `AGENTS.md`.
@@ -155,7 +155,7 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 | `gsheets` | auth (service account JWT / ADC refresh / token), chunked parallel grid fetch with retry, conversion |
 | `xlsx` | calamine: values, formulas, defined names, merges, VBA; csv |
 | `ooxml` | xlsx/xlsm package parts calamine skips: styles, validation, conditional formats, comments, hyperlinks, frozen/hidden rows and cols, filters, protection, tables, charts, pivots, external workbook links |
-| `formula` | reference lexer (quoted/Thai sheet names, open-ended `A2:A`, whole rows/cols, `'[Book.xlsx]Sheet'`), R1C1 keys, function census |
+| `formula` | reference lexer (quoted and non-English sheet names, open-ended `A2:A`, whole rows/cols, `'[Book.xlsx]Sheet'`), R1C1 keys, function census |
 | `analyze` | copy-groups, families, blocks, cross-sheet edges, externals |
 | `report` | REPORT.md |
 | `graph` | graph.json |

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Installs the latest sheetgraph release into ~/.local/bin (override with SHEETGRAPH_INSTALL_DIR).
-#   curl -fsSL https://raw.githubusercontent.com/asharma327/spreadsheet-extractor/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/asharma327/sheetgraph/main/install.sh | sh
 set -eu
 
-repo="asharma327/spreadsheet-extractor"
+repo="asharma327/sheetgraph"
 dir="${SHEETGRAPH_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)-$(uname -m)" in

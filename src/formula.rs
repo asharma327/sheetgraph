@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn thai_sheet_and_numbers() {
+    fn unicode_sheet_and_numbers() {
         let f = "=รายการ!B2*1E+5+1.5+LOG10(A1)";
         let lx = lex(f);
         assert_eq!(lx.refs.len(), 2);

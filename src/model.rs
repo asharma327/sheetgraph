@@ -36,6 +36,10 @@ pub struct Workbook {
     /// Data connections: databases, web queries, text imports, Power Query.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connections: Vec<Connection>,
+    /// Discussion comments the source doesn't tie to a cell (Google Drive
+    /// comments). Excel comments are cell notes ([`Cell::note`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
     /// Anything the backend could not extract, so consumers know what is missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -105,6 +109,18 @@ pub struct Sheet {
     pub hidden_cols: Vec<(u32, u32)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banded: Vec<Rect>,
+    /// Columns not at the sheet's default width: (first, last, pixels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub col_widths: Vec<(u32, u32, u32)>,
+    /// Rows not at the default height: (first, last, pixels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_heights: Vec<(u32, u32, u32)>,
+    /// Gridlines turned off: laid out as a page or form rather than a grid.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_gridlines: bool,
+    /// Grouped rows and columns, which can be collapsed to their summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outlines: Vec<Outline>,
     /// Excel tables (ListObjects); formulas reach them as `Name[Column]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<Table>,
@@ -200,6 +216,8 @@ pub struct Cell {
     pub s: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dv: Option<u32>,
+    /// Note or comment thread, each message as `Author: text` when the
+    /// author is known, replies after `\n↳ `.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -487,6 +505,85 @@ pub struct Calc {
     pub max_iterations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_change: Option<f64>,
+}
+
+/// A run of grouped rows or columns (an outline level).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Outline {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cols: bool,
+    /// First and last row (or column), 0-based and inclusive.
+    pub span: (u32, u32),
+    /// 1 for an outer group, 2 for one inside it, …
+    pub depth: u32,
+    /// Collapsed: the group's rows or columns are hidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub collapsed: bool,
+}
+
+/// Grouped spans from outline levels: `levels` holds (first, last, level)
+/// with level > 0, sorted. A group is collapsed when `hidden` covers all of it.
+pub fn outlines(levels: &[(u32, u32, u32)], hidden: &[(u32, u32)], cols: bool) -> Vec<Outline> {
+    let mut hidden = hidden.to_vec();
+    hidden.sort_unstable();
+    let covered = |(a, b): (u32, u32)| {
+        let mut next = a;
+        for h in hidden.iter().filter(|h| h.1 >= a && h.0 <= b) {
+            if h.0 > next {
+                return false;
+            }
+            next = next.max(h.1.saturating_add(1));
+        }
+        next > b
+    };
+    let max = levels.iter().map(|l| l.2).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for depth in 1..=max {
+        let mut run: Option<(u32, u32)> = None;
+        let mut flush = |run: Option<(u32, u32)>| {
+            if let Some(span) = run {
+                out.push(Outline { cols, span, depth, collapsed: covered(span) });
+            }
+        };
+        for &(a, b, _) in levels.iter().filter(|l| l.2 >= depth) {
+            run = match run {
+                Some((s, e)) if e + 1 == a => Some((s, b)),
+                prev => {
+                    flush(prev);
+                    Some((a, b))
+                }
+            };
+        }
+        flush(run);
+    }
+    out.sort_by_key(|o| (o.span.0, o.depth));
+    out
+}
+
+/// Add index `i` with value `v` to (first, last, value) spans built in order.
+pub fn push_sized(spans: &mut Vec<(u32, u32, u32)>, i: u32, v: u32) {
+    match spans.last_mut() {
+        Some(last) if last.1 + 1 == i && last.2 == v => last.1 = i,
+        _ => spans.push((i, i, v)),
+    }
+}
+
+/// A comment thread on the file (see [`Workbook::comments`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Comment {
+    pub author: String,
+    pub text: String,
+    /// What the commented cell showed when the comment was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<String>,
+    /// The cell (`Sheet!A1`) that shows `quoted`, when exactly one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolved: bool,
+    /// (author, text) of each reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<(String, String)>,
 }
 
 /// A data connection the workbook refreshes from.

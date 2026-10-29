@@ -3,7 +3,7 @@
 
 use crate::a1::{col_name, Rect};
 use crate::analyze::{cells_in, cover, find_cell, fingerprint, Analysis, Group, SheetAnalysis};
-use crate::model::{Cell, ColStats, Sheet, Span, Style, Validation, Value, Workbook};
+use crate::model::{Cell, ColStats, Comment, Outline, Sheet, Span, Style, Validation, Value, Workbook};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
@@ -333,6 +333,24 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
             let _ = writeln!(s, "{} = {}", d["metadataKey"].as_str().unwrap_or("?"), trunc(d["metadataValue"].as_str().unwrap_or(""), 80));
         }
     }
+    if !wb.comments.is_empty() {
+        let resolved = wb.comments.iter().filter(|c| c.resolved).count();
+        let _ = writeln!(s, "\n## Comments ({}{})", wb.comments.len(), if resolved > 0 { format!(", {resolved} resolved") } else { String::new() });
+        // Open threads first.
+        let mut order: Vec<&Comment> = wb.comments.iter().collect();
+        order.sort_by_key(|c| c.resolved);
+        for c in order.iter().take(20) {
+            let at = match (&c.cell, &c.quoted) {
+                (Some(cell), Some(q)) => format!("{cell} ({})", trunc(q, 40)),
+                (None, Some(q)) => format!("cell showing \"{}\"", trunc(q, 40)),
+                _ => "cell not given".into(),
+            };
+            let _ = writeln!(s, "{at} — {}", trunc(&crate::query::comment_text(c), 200));
+        }
+        if wb.comments.len() > 20 {
+            let _ = writeln!(s, "+{} more comments", wb.comments.len() - 20);
+        }
+    }
     if !wb.warnings.is_empty() {
         let _ = writeln!(s, "\n## Extraction notes");
         for w in &wb.warnings {
@@ -536,6 +554,9 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
     if let Some(t) = &sh.tab_color {
         let _ = write!(head, " · tab {t}");
     }
+    if sh.no_gridlines {
+        head.push_str(" · gridlines off");
+    }
     let _ = writeln!(s, "{head}");
     if let Some(e) = &sh.elided {
         let _ = writeln!(
@@ -709,6 +730,12 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
     if !sh.hidden_cols.is_empty() {
         misc.push(format!("hidden cols: {}", spans(&sh.hidden_cols, col_name)));
     }
+    for (cols, what) in [(false, "rows"), (true, "cols")] {
+        let groups: Vec<&Outline> = sh.outlines.iter().filter(|o| o.cols == cols).collect();
+        if !groups.is_empty() {
+            misc.push(format!("grouped {what}: {}", outline_list(&groups)));
+        }
+    }
     if !sh.banded.is_empty() {
         misc.push(format!("banded: {}", rect_list(&sh.banded, 4)));
     }
@@ -871,6 +898,27 @@ fn typed_arithmetic(sa: &SheetAnalysis) -> String {
         eg.join(" "),
         trunc(&cols.iter().map(|c| col_name(*c)).collect::<Vec<_>>().join(","), 80)
     )
+}
+
+/// `5-8 (collapsed), 12-20, 14-16 (level 2)`.
+fn outline_list(groups: &[&Outline]) -> String {
+    let name = |i: u32| if groups[0].cols { col_name(i) } else { (i + 1).to_string() };
+    let mut parts: Vec<String> = groups
+        .iter()
+        .take(8)
+        .map(|o| {
+            let mut t = if o.span.0 == o.span.1 { name(o.span.0) } else { format!("{}-{}", name(o.span.0), name(o.span.1)) };
+            let notes: Vec<String> = [(o.depth > 1).then(|| format!("level {}", o.depth)), o.collapsed.then(|| "collapsed".into())].into_iter().flatten().collect();
+            if !notes.is_empty() {
+                let _ = write!(t, " ({})", notes.join(", "));
+            }
+            t
+        })
+        .collect();
+    if groups.len() > 8 {
+        parts.push(format!("+{}", groups.len() - 8));
+    }
+    parts.join(", ")
 }
 
 fn spans(v: &[(u32, u32)], f: impl Fn(u32) -> String) -> String {

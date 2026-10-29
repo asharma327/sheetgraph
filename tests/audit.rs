@@ -4,7 +4,7 @@
 
 use sheetgraph::a1::parse_rect;
 use sheetgraph::analyze::{analyze, find_cell, sheet_index, Analysis};
-use sheetgraph::model::{Cell, Sheet, Value, Workbook};
+use sheetgraph::model::{Cell, Outline, Sheet, Value, Workbook};
 
 fn load() -> Workbook {
     load_fixture("audit.xlsx")
@@ -94,6 +94,24 @@ fn tabs() {
 }
 
 #[test]
+fn layout() {
+    let wb = load();
+    let obj = sheet(&wb, "Objects");
+    // Pixels: column D at 30 characters, the grouped F:G at openpyxl's 13; row 2 at 40pt.
+    assert_eq!(obj.col_widths, [(3, 3, 210), (5, 6, 91)]);
+    assert_eq!(obj.row_heights, [(1, 1, 53)]);
+    assert!(obj.no_gridlines && !sheet(&wb, "Inputs").no_gridlines);
+    // Width 0 and height 0 hide a column and a row.
+    assert_eq!((obj.hidden_rows.as_slice(), obj.hidden_cols.as_slice()), ([(5, 6), (11, 11)].as_slice(), [(10, 10)].as_slice()));
+    let o = |cols, span, depth, collapsed| Outline { cols, span, depth, collapsed };
+    assert_eq!(obj.outlines, [o(false, (4, 7), 1, false), o(false, (5, 6), 2, true), o(true, (5, 6), 1, false)]);
+
+    let a = analyze(&wb);
+    let found = sheetgraph::query::find(&wb, &a, "sam ortiz", 10);
+    assert!(found.contains("Inputs!G4 = rate?"), "{found}");
+}
+
+#[test]
 fn cells() {
     let wb = load();
     let inp = sheet(&wb, "Inputs");
@@ -128,7 +146,10 @@ fn cells() {
     let props = &stock.obj.as_ref().expect("data type").props;
     assert!(props.contains(&("Price".into(), "412.5".into())) && props.contains(&("Exchange".into(), "NASDAQ".into())), "{props:?}");
 
-    assert_eq!(at(inp, "G2").note.as_deref(), Some("Check with finance"));
+    // Notes and comment threads carry their authors.
+    assert_eq!(at(inp, "G2").note.as_deref(), Some("Analyst: Check with finance"));
+    assert_eq!(at(inp, "G3").note.as_deref(), Some("Reviewer:\nLooks right"), "author already in the text");
+    assert_eq!(at(inp, "G4").note.as_deref(), Some("Dana Lee: Is this the Q3 rate?\n↳ Sam Ortiz: Yes, confirmed\n(resolved)"));
     assert_eq!(at(inp, "H2").link.as_deref(), Some("https://example.com/policy"));
     assert!(at(inp, "I2").dv.is_some() && at(inp, "I3").dv.is_some());
     assert_eq!(inp.merges.iter().map(|r| r.a1()).collect::<Vec<_>>(), ["A8:C8"]);
@@ -278,6 +299,9 @@ fn report() {
         "border top thin, bottom double (1 cells): N4\n",
         "=Inputs!B8 [reads B8 inside merge A8:C8: blank]\n",
         "merged: 3× column A, 2 rows each, rows 2–7; 4× 3 columns wide over row 1, B:M; O1:P2\n",
+        "## 6. Objects · A1:A12 · 10 cells · gridlines off\n",
+        "hidden rows: 6-7, 12\nhidden cols: K\ngrouped rows: 5-8, 6-7 (level 2, collapsed)\ngrouped cols: F-G\n",
+        "G4: Dana Lee: Is this the Q3 rate?⏎↳ Sam Ortiz: Yes, confirmed⏎(resolved)\n",
     ] {
         assert!(r.contains(want), "missing {want:?} in\n{r}");
     }

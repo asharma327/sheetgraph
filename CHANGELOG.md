@@ -46,6 +46,15 @@ All notable changes to this project are documented here. The format follows
   REPORT.md folds repeating merges (`12× A:C, 1 row each, rows 8–30`); formulas reading a cell hidden under a merge
   (always blank) are flagged.
 - Google Sheets slicers (as filters) and Tables.
+- Column widths and row heights in pixels where they differ from the default (`Sheet.col_widths`,
+  `Sheet.row_heights`); a column of width 0 or a row of height 0 counts as hidden. Gridlines turned off
+  (`Sheet.no_gridlines`) show in the sheet's REPORT.md header.
+- Grouped rows and columns with their level and whether they're collapsed (`Sheet.outlines`), from Excel and Google,
+  listed per sheet in REPORT.md.
+- Notes and comment threads carry their authors (`Analyst: Check with finance`, replies after `↳`, resolved threads
+  marked). Google Drive comments, which the Sheets API doesn't return, are read too (`Workbook.comments`) and tied to
+  a cell when exactly one cell shows the text they quote; REPORT.md lists them, `cells` shows them on their cell and
+  `find` searches them.
 
 ### Fixed
 

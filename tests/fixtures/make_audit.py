@@ -4,8 +4,9 @@ sheetgraph's output can be checked item by item in tests/audit.rs. Also
 builds tests/fixtures/Other.xlsx, the workbook audit.xlsx links to.
 
 openpyxl writes most of it. Images (floating and in a cell), a linked data
-type, shapes, a form button, data connections, a Power Query and sparklines are
-added afterwards as raw package parts.
+type, shapes, a form button, data connections, a Power Query, sparklines, a
+threaded comment and zero sizes (which openpyxl drops) are added afterwards as
+raw package parts.
 
     pip install openpyxl==3.1.5
     python tests/fixtures/make_audit.py
@@ -85,6 +86,11 @@ def build() -> bytes:
     inp["F2"] = CellRichText(["Total ", TextBlock(InlineFont(b=True, color="FF0000"), "due")])
     inp["G2"] = "see note"
     inp["G2"].comment = Comment("Check with finance", "Analyst")
+    inp["G3"] = "reviewed"
+    inp["G3"].comment = Comment("Reviewer:\nLooks right", "Reviewer")  # Excel writes the author into the text
+    inp["G4"] = "rate?"
+    # Excel keeps a placeholder note for a threaded comment (added in add_parts).
+    inp["G4"].comment = Comment("[Threaded comment]\n\nComment:\n    Is this the Q3 rate?", "tc={00000000-0000-0000-0000-0000000000a1}")
     inp["H2"] = "site"
     inp["H2"].hyperlink = "https://example.com/policy"
     inp["H3"] = "go to calc"
@@ -177,6 +183,13 @@ def build() -> bytes:
     obj.row_dimensions[2].height = 40
     for r in range(5, 9):
         obj.row_dimensions[r].outlineLevel = 1
+    for r in (6, 7):  # a nested group, collapsed
+        obj.row_dimensions[r].outlineLevel = 2
+        obj.row_dimensions[r].hidden = True
+    obj.column_dimensions.group("F", "G", outline_level=1)
+    obj["A12"] = "zero height"
+    obj.row_dimensions[12].height = 0.75  # set to 0 in add_parts
+    obj.column_dimensions["K"].width = 0.5  # set to 0 in add_parts
     obj.sheet_view.showGridLines = False
 
     # ---------------- Layout: repeating merges (period headers across, labels down)
@@ -263,6 +276,19 @@ RICH_VALUES = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 RICH_RELS = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <richValueRels xmlns="http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel" xmlns:r="{R}"><rel r:id="rId1"/></richValueRels>"""
 
+TC_REL = "http://schemas.microsoft.com/office/2017/10/relationships"
+TC = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"
+THREADED = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="{TC}" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\
+<threadedComment ref="G4" dT="2026-01-10T09:00:00.00" personId="{{0000000000-p1}}" id="{{00000000-0000-0000-0000-0000000000a1}}" done="1"><text>Is this the Q3 rate?</text></threadedComment>\
+<threadedComment ref="G4" dT="2026-01-10T10:00:00.00" personId="{{0000000000-p2}}" id="{{00000000-0000-0000-0000-0000000000a2}}" parentId="{{00000000-0000-0000-0000-0000000000a1}}"><text>Yes, confirmed</text></threadedComment>\
+</ThreadedComments>"""
+PERSONS = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<personList xmlns="{TC}" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">\
+<person displayName="Dana Lee" id="{{0000000000-p1}}" userId="dana@example.com" providerId="None"/>\
+<person displayName="Sam Ortiz" id="{{0000000000-p2}}" userId="sam@example.com" providerId="None"/>\
+</personList>"""
+
 SECTION1 = """section Section1;
 
 shared Prices = let
@@ -305,6 +331,7 @@ def add_parts(xlsx: bytes) -> bytes:
     sheet_rels = f"xl/worksheets/_rels/{name}.rels"
 
     xml = files[sheet].decode()
+    xml = xml.replace('ht="0.75"', 'ht="0"').replace('width="0.5"', 'width="0"')
     xml = xml.replace("</worksheet>", f'<drawing r:id="rIdObjD"/><legacyDrawing r:id="rIdObjV"/>{SPARKLINES}</worksheet>')
     if 'xmlns:r=' not in xml.split(">", 1)[0]:
         xml = xml.replace("<worksheet ", f'<worksheet xmlns:r="{R}" ', 1)
@@ -350,6 +377,16 @@ def add_parts(xlsx: bytes) -> bytes:
     xml = xml.replace(row2, row2.replace("</row>", cells + "</row>"))
     xml = re.sub(r'<dimension ref="[^"]*"/>', '<dimension ref="A1:Z8"/>', xml)
     files[inputs] = xml.encode()
+    # Inputs!G4: a threaded comment with a reply, resolved.
+    files["xl/threadedComments/threadedComment1.xml"] = THREADED.encode()
+    files["xl/persons/person.xml"] = PERSONS.encode()
+    in_rels = "xl/worksheets/_rels/sheet1.xml.rels"
+    files[in_rels] = files[in_rels].decode().replace(
+        "</Relationships>", f'<Relationship Id="rIdTc1" Type="{TC_REL}/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>'
+    ).encode()
+    files["xl/_rels/workbook.xml.rels"] = files["xl/_rels/workbook.xml.rels"].decode().replace(
+        "</Relationships>", f'<Relationship Id="rIdPers1" Type="{TC_REL}/person" Target="persons/person.xml"/></Relationships>'
+    ).encode()
     types = files["[Content_Types].xml"].decode()
     types = types.replace(
         "</Types>",
@@ -361,6 +398,8 @@ def add_parts(xlsx: bytes) -> bytes:
         '<Override PartName="/xl/richData/rdrichvalue.xml" ContentType="application/vnd.ms-excel.rdrichvalue+xml"/>'
         '<Override PartName="/xl/richData/rdrichvaluestructure.xml" ContentType="application/vnd.ms-excel.rdrichvaluestructure+xml"/>'
         '<Override PartName="/xl/richData/richValueRel.xml" ContentType="application/vnd.ms-excel.richvaluerel+xml"/>'
+        '<Override PartName="/xl/threadedComments/threadedComment1.xml" ContentType="application/vnd.ms-excel.threadedcomments+xml"/>'
+        '<Override PartName="/xl/persons/person.xml" ContentType="application/vnd.ms-excel.person+xml"/>'
         "</Types>",
     )
     files["[Content_Types].xml"] = types.encode()

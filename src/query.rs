@@ -102,6 +102,12 @@ fn describe_cell(wb: &Workbook, a: &Analysis, si: usize, c: &Cell) -> String {
     if let Some(n) = &c.note {
         let _ = write!(s, "  [note: {}]", trunc(n, 120));
     }
+    if !wb.comments.is_empty() {
+        let here = format!("{}!{}", quote_sheet(&wb.sheets[si].name), crate::a1::cell_name(c.r, c.c));
+        for cm in wb.comments.iter().filter(|x| x.cell.as_deref() == Some(here.as_str())) {
+            let _ = write!(s, "  [comment {}]", trunc(&comment_text(cm), 160));
+        }
+    }
     if let Some(l) = &c.link {
         let _ = write!(s, "  [link {}]", trunc(l, 80));
     }
@@ -458,7 +464,19 @@ fn merge_ref(refs: &mut Vec<(usize, Rect)>, ts: usize, r: Rect) {
     refs.push((ts, r));
 }
 
-/// Case-insensitive search over values, formulas, notes and sheet names.
+/// `Author: text ↳ Other: reply`, marked when resolved.
+pub fn comment_text(c: &crate::model::Comment) -> String {
+    let mut t = format!("{}: {}", c.author, c.text);
+    for (who, text) in &c.replies {
+        let _ = write!(t, " ↳ {who}: {text}");
+    }
+    if c.resolved {
+        t.push_str(" (resolved)");
+    }
+    t
+}
+
+/// Case-insensitive search over values, formulas, notes, comments and sheet names.
 pub fn find(wb: &Workbook, a: &Analysis, needle: &str, limit: usize) -> String {
     let n = needle.to_lowercase();
     let mut s = String::new();
@@ -482,6 +500,15 @@ pub fn find(wb: &Workbook, a: &Analysis, needle: &str, limit: usize) -> String {
                     let p = a.macros.iter().find(|p| p.script == i && p.lines.0 <= ln + 1 && ln < p.lines.1);
                     let _ = writeln!(s, "{} {}:{}{}: {}", sc.kind, sc.name, ln + 1, p.map(|p| format!(" ({})", p.name)).unwrap_or_default(), trunc(line.trim(), 160));
                 }
+            }
+        }
+    }
+    for cm in &wb.comments {
+        if comment_text(cm).to_lowercase().contains(&n) {
+            hits += 1;
+            if hits <= limit {
+                let at = cm.cell.clone().or(cm.quoted.as_ref().map(|q| format!("cell showing \"{}\"", trunc(q, 40)))).unwrap_or_else(|| "a cell not given".into());
+                let _ = writeln!(s, "comment on {at}: {}", trunc(&comment_text(cm), 160));
             }
         }
     }

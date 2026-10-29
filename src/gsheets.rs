@@ -164,6 +164,7 @@ struct RowData {
 #[serde(rename_all = "camelCase", default)]
 struct DimMeta {
     hidden_by_user: bool,
+    pixel_size: Option<u32>,
 }
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -229,7 +230,7 @@ impl ExtValue {
 pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
     let id = crate::formula::spreadsheet_id(id_or_url);
     let meta_fields = "spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone,autoRecalc,iterativeCalculationSettings),namedRanges,dataSources,developerMetadata,\
-        sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata,slicers,tables)";
+        sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata,slicers,tables,rowGroups,columnGroups)";
     let meta: J = serde_json::from_str(&auth.get(&format!("{SHEETS}/{id}"), &[("fields", meta_fields)])?)?;
 
     let mut wb = Workbook {
@@ -245,7 +246,8 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
         ..Default::default()
     };
     wb.calc = calc(&meta["properties"]);
-    // Drive metadata is best-effort: needs the drive scope and visibility.
+    // Drive metadata and comments are best-effort: they need the drive scope and visibility.
+    let mut drive_ok = false;
     match auth.get(
         &format!("https://www.googleapis.com/drive/v3/files/{id}"),
         &[("fields", "modifiedTime,owners(emailAddress),lastModifyingUser(emailAddress)"), ("supportsAllDrives", "true")],
@@ -254,8 +256,9 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
             let d: J = serde_json::from_str(&t).unwrap_or_default();
             wb.source.modified = d["modifiedTime"].as_str().map(Into::into);
             wb.source.owner = d["owners"][0]["emailAddress"].as_str().map(Into::into);
+            drive_ok = true;
         }
-        Err(e) => wb.warnings.push(format!("drive metadata unavailable: {}", short(&e.to_string()))),
+        Err(e) => wb.warnings.push(format!("drive metadata and comments unavailable: {}", short(&e.to_string()))),
     }
 
     let sheets_j = meta["sheets"].as_array().cloned().unwrap_or_default();
@@ -281,8 +284,11 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
             frozen_rows: gp["frozenRowCount"].as_u64().unwrap_or(0) as u32,
             frozen_cols: gp["frozenColumnCount"].as_u64().unwrap_or(0) as u32,
             tab_color: color_hex(&p["tabColorStyle"]["rgbColor"]).or_else(|| color_hex(&p["tabColor"])),
+            no_gridlines: gp["hideGridlines"].as_bool().unwrap_or(false),
             ..Default::default()
         };
+        sh.outlines = arr(&s["rowGroups"]).iter().chain(arr(&s["columnGroups"])).filter_map(outline).collect();
+        sh.outlines.sort_by_key(|o| (o.cols, o.span.0, o.depth));
         for m in arr(&s["merges"]) {
             sh.merges.push(gr(m));
         }
@@ -348,7 +354,7 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
         }
     }
     let total = jobs.len();
-    let fields = "sheets(data(startRow,startColumn,rowMetadata(hiddenByUser),columnMetadata(hiddenByUser),\
+    let fields = "sheets(data(startRow,startColumn,rowMetadata(hiddenByUser,pixelSize),columnMetadata(hiddenByUser,pixelSize),\
         rowData(values(userEnteredValue,effectiveValue,formattedValue,userEnteredFormat,dataValidation,note,hyperlink,pivotTable,\
         textFormatRuns,chipRuns))))";
     let names: Vec<(String, u32)> = wb.sheets.iter().map(|s| (s.name.clone(), s.grid_cols)).collect();
@@ -401,16 +407,96 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
     for sh in &mut wb.sheets {
         sh.cells.sort_by_key(|c| (c.r, c.c));
         sh.hidden_rows = merge_spans(std::mem::take(&mut sh.hidden_rows));
+        sh.row_heights = merge_sized(std::mem::take(&mut sh.row_heights));
     }
     wb.styles = styles.items;
     wb.validations = dvs.items;
     canonicalize(&mut wb);
+    if drive_ok {
+        match drive_comments(auth, &id) {
+            Ok(c) => wb.comments = place_comments(&wb, c),
+            Err(e) => wb.warnings.push(format!("comments unavailable: {}", short(&e.to_string()))),
+        }
+    }
     wb.warnings.push(
         "Apps Script (bound scripts, macros, add-ons, triggers) is not exposed by the Sheets API; \
          pass --apps-script <scriptId> with user credentials to include a project"
             .into(),
     );
     Ok(wb)
+}
+
+/// Comment threads on the file, from the Drive API. Their anchors are opaque
+/// ids, so [`place_comments`] finds the cell from the text it quotes.
+fn drive_comments(auth: &Auth, id: &str) -> Result<Vec<Comment>> {
+    let fields = "nextPageToken,comments(author(displayName),content,resolved,quotedFileContent(value),replies(author(displayName),content))";
+    let mut out = Vec::new();
+    let mut page = String::new();
+    for _ in 0..20 {
+        let mut q = vec![("fields", fields), ("pageSize", "100")];
+        if !page.is_empty() {
+            q.push(("pageToken", page.as_str()));
+        }
+        let j: J = serde_json::from_str(&auth.get(&format!("https://www.googleapis.com/drive/v3/files/{id}/comments"), &q)?)?;
+        out.extend(arr(&j["comments"]).iter().map(drive_comment));
+        match j["nextPageToken"].as_str() {
+            Some(t) => page = t.to_string(),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+fn drive_comment(c: &J) -> Comment {
+    let who = |m: &J| m["author"]["displayName"].as_str().unwrap_or_default().to_string();
+    Comment {
+        author: who(c),
+        text: c["content"].as_str().unwrap_or_default().trim().into(),
+        quoted: c["quotedFileContent"]["value"].as_str().map(unescape_html).filter(|q| !q.is_empty()),
+        cell: None,
+        resolved: c["resolved"].as_bool().unwrap_or(false),
+        // Resolving or reopening a thread adds a reply with no text.
+        replies: arr(&c["replies"])
+            .iter()
+            .filter_map(|r| Some((who(r), r["content"].as_str().map(str::trim).filter(|t| !t.is_empty())?.to_string())))
+            .collect(),
+    }
+}
+
+/// A row or column group (DimensionGroup).
+fn outline(g: &J) -> Option<Outline> {
+    let r = &g["range"];
+    let (a, b) = (r["startIndex"].as_u64().unwrap_or(0) as u32, r["endIndex"].as_u64()? as u32);
+    (b > a).then(|| Outline {
+        cols: r["dimension"] == "COLUMNS",
+        span: (a, b - 1),
+        depth: g["depth"].as_u64().unwrap_or(1) as u32,
+        collapsed: g["collapsed"].as_bool().unwrap_or(false),
+    })
+}
+
+/// Tie each comment to the one cell showing the text it quotes, if exactly one does.
+fn place_comments(wb: &Workbook, mut comments: Vec<Comment>) -> Vec<Comment> {
+    let mut seen: HashMap<&str, (u32, Option<String>)> = comments.iter().filter_map(|c| Some((c.quoted.as_deref()?, (0, None)))).collect();
+    if !seen.is_empty() {
+        for sh in &wb.sheets {
+            for c in &sh.cells {
+                if let Some(hit) = seen.get_mut(c.display().as_str()) {
+                    hit.0 += 1;
+                    hit.1 = Some(format!("{}!{}", quote_sheet(&sh.name), crate::a1::cell_name(c.r, c.c)));
+                }
+            }
+        }
+    }
+    let cells: HashMap<String, Option<String>> = seen.into_iter().map(|(q, (n, at))| (q.to_string(), at.filter(|_| n == 1))).collect();
+    for c in &mut comments {
+        c.cell = c.quoted.as_ref().and_then(|q| cells.get(q).cloned().flatten());
+    }
+    comments
+}
+
+fn unescape_html(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&")
 }
 
 /// Fetch an Apps Script project's source (needs user OAuth with script.projects.readonly).
@@ -440,11 +526,18 @@ fn absorb(
         if m.hidden_by_user {
             push_span(&mut sh.hidden_rows, sr + i as u32);
         }
+        if let Some(px) = m.pixel_size.filter(|p| *p != DEFAULT_ROW_PX) {
+            push_sized(&mut sh.row_heights, sr + i as u32, px);
+        }
     }
-    if sh.hidden_cols.is_empty() && sr == 0 {
+    // Every chunk spans all columns; the first one reports them.
+    if sr == 0 {
         for (i, m) in gd.column_metadata.iter().enumerate() {
             if m.hidden_by_user {
                 push_span(&mut sh.hidden_cols, sc + i as u32);
+            }
+            if let Some(px) = m.pixel_size.filter(|p| *p != DEFAULT_COL_PX) {
+                push_sized(&mut sh.col_widths, sc + i as u32, px);
             }
         }
     }
@@ -480,6 +573,23 @@ fn absorb(
             sh.cells.push(cell);
         }
     }
+}
+
+/// Google's default row height and column width.
+const DEFAULT_ROW_PX: u32 = 21;
+const DEFAULT_COL_PX: u32 = 100;
+
+/// Sizes from chunks fetched in any order, sorted and joined again.
+fn merge_sized(mut v: Vec<(u32, u32, u32)>) -> Vec<(u32, u32, u32)> {
+    v.sort();
+    let mut out: Vec<(u32, u32, u32)> = Vec::new();
+    for (a, b, px) in v {
+        match out.last_mut() {
+            Some(l) if l.1 + 1 == a && l.2 == px => l.1 = b,
+            _ => out.push((a, b, px)),
+        }
+    }
+    out
 }
 
 fn merge_spans(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -846,5 +956,35 @@ mod tests {
 
         let cond = json!({"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": "=$C2>Inputs!B1"}]});
         assert_eq!(cond_values(&cond), ["=$C2>Inputs!B1"]);
+    }
+
+    #[test]
+    fn layout_groups_and_comments() {
+        // Sizes and hidden rows from a chunk's dimension metadata.
+        let mut sh = Sheet { name: "Plan".into(), ..Default::default() };
+        let gd: GridData = serde_json::from_value(json!({
+            "rowMetadata": [{"pixelSize": 21}, {"pixelSize": 40}, {"pixelSize": 40}, {"pixelSize": 21, "hiddenByUser": true}],
+            "columnMetadata": [{"pixelSize": 100}, {"pixelSize": 12}, {"pixelSize": 250}],
+            "rowData": [{"values": [{"formattedValue": "45", "effectiveValue": {"numberValue": 45}}, {"formattedValue": "Total", "effectiveValue": {"stringValue": "Total"}}]},
+                        {"values": [{"formattedValue": "45", "effectiveValue": {"numberValue": 45}}]}],
+        }))
+        .unwrap();
+        absorb(&mut sh, 0, gd, &mut Interner::default(), &mut Interner::default(), &HashMap::new());
+        assert_eq!((sh.row_heights.as_slice(), sh.col_widths.as_slice(), sh.hidden_rows.as_slice()), ([(1, 2, 40)].as_slice(), [(1, 1, 12), (2, 2, 250)].as_slice(), [(3, 3)].as_slice()));
+        assert_eq!(merge_sized(vec![(5, 6, 40), (0, 1, 40), (2, 4, 40), (7, 7, 30)]), [(0, 6, 40), (7, 7, 30)]);
+
+        let g = outline(&json!({"range": {"dimension": "COLUMNS", "startIndex": 3, "endIndex": 6}, "depth": 2, "collapsed": true})).unwrap();
+        assert_eq!(g, Outline { cols: true, span: (3, 5), depth: 2, collapsed: true });
+
+        let wb = Workbook { sheets: vec![sh], ..Default::default() };
+        let c = |q: &str| drive_comment(&json!({
+            "author": {"displayName": "Ana"}, "content": "why? ", "resolved": true,
+            "quotedFileContent": {"mimeType": "text/html", "value": q},
+            "replies": [{"author": {"displayName": "Bo"}, "content": "fixed"}, {"author": {"displayName": "Bo"}, "content": ""}],
+        }));
+        let placed = place_comments(&wb, vec![c("Total"), c("45"), c("gone")]);
+        let at: Vec<Option<&str>> = placed.iter().map(|c| c.cell.as_deref()).collect();
+        assert_eq!(at, [Some("Plan!B1"), None, None], "45 shows twice; nothing shows `gone`");
+        assert_eq!(crate::query::comment_text(&placed[0]), "Ana: why? ↳ Bo: fixed (resolved)");
     }
 }

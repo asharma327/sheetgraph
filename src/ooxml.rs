@@ -7,7 +7,7 @@
 //! failed extraction. Values and formulas still come from calamine.
 
 use crate::a1::{col_name, parse_pt, parse_rect, quote_sheet, Rect, OPEN};
-use crate::model::{fmt_num, Value, 
+use crate::model::{fmt_num, outlines, push_sized, Value,
     Calc, Cell, CellObject, Chart, CondFormat, Connection, ExternalLink, Filter, Interner, NamedRange, Pivot, Protected, Run, Script, Shape, Sheet, Style,
     Table, Validation, Workbook,
 };
@@ -38,6 +38,10 @@ pub fn enrich(path: &Path, wb: &mut Workbook) -> Result<()> {
     let mut skipped: BTreeSet<&str> = BTreeSet::new();
     let rich = part_of("sharedStrings").map(|p| rich_strings(&mut pkg, &p, &styles)).unwrap_or_default();
     let objects = rich_values(&mut pkg);
+    let persons: HashMap<String, String> = part_of("person")
+        .and_then(|p| pkg.node(&p))
+        .map(|n| n.children("person").filter_map(|x| Some((x.attr("id")?.to_string(), x.attr("displayName")?.to_string()))).collect())
+        .unwrap_or_default();
 
     wb.external_links = external_links(&mut pkg, &root, &rels);
     // calamine drops which sheet a name belongs to; read the names again.
@@ -55,7 +59,7 @@ pub fn enrich(path: &Path, wb: &mut Workbook) -> Result<()> {
     for s in root.child("sheets").map(|s| s.children("sheet").collect::<Vec<_>>()).unwrap_or_default() {
         let (Some(name), Some(rel)) = (s.attr("name"), s.attr("id").and_then(|id| rels.get(id))) else { continue };
         let Some(si) = wb.sheets.iter().position(|x| x.name == name) else { continue };
-        let mut cx = SheetCx { styles: &styles, xf_ids: &xf_ids, dvs: &mut dvs, skipped: &mut skipped, rich: &rich, objects: &objects };
+        let mut cx = SheetCx { styles: &styles, xf_ids: &xf_ids, dvs: &mut dvs, skipped: &mut skipped, rich: &rich, objects: &objects, persons: &persons };
         if let Err(e) = read_sheet(&mut pkg, &rel.target, &rel.kind, &mut wb.sheets[si], &mut cx) {
             wb.warnings.push(format!("{name}: {e:#}"));
         }
@@ -307,6 +311,8 @@ struct SheetCx<'a> {
     rich: &'a HashMap<u32, Vec<Run>>,
     /// Pictures and data types by cell `vm` (value metadata) index, from 0.
     objects: &'a [Option<CellObject>],
+    /// Threaded-comment authors by person id.
+    persons: &'a HashMap<String, String>,
 }
 
 /// One pass over a worksheet part: cell style ids and hidden rows are taken
@@ -315,6 +321,10 @@ struct SheetCx<'a> {
 struct SheetXml {
     styled: Vec<(u32, u32, u32)>,
     hidden_rows: Vec<(u32, u32)>,
+    /// Rows with a stored height: (first, last, pixels).
+    row_heights: Vec<(u32, u32, u32)>,
+    /// Rows in outline groups: (first, last, level).
+    row_levels: Vec<(u32, u32, u32)>,
     nodes: Vec<Node>,
     /// Corrected text for shared formulas whose defining cell isn't the top-left
     /// of their range (see [`shared_formula`]).
@@ -387,19 +397,28 @@ fn read_sheet_data<R: BufRead>(rd: &mut Reader<R>, out: &mut SheetXml, buf: &mut
             }
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 "row" => {
-                    let (mut r, mut hidden) = (None, false);
+                    let (mut r, mut hidden, mut px, mut level) = (None, false, None, 0);
                     for a in e.attributes().flatten() {
                         match a.key.local_name().as_ref() {
                             "r" => r = a.value.parse::<u32>().ok().filter(|r| *r > 0),
                             "hidden" => hidden = matches!(a.value.as_ref(), "1" | "true"),
+                            "ht" => px = a.value.parse::<f64>().ok().filter(|h| *h >= 0.0).map(pt_to_px),
+                            "outlineLevel" => level = a.value.parse::<u32>().unwrap_or(0),
                             _ => {}
                         }
                     }
                     row = r.map(|r| r - 1).unwrap_or(if started { row + 1 } else { 0 });
                     started = true;
                     next_col = 0;
-                    if hidden {
+                    // A row of height 0 is hidden too.
+                    if hidden || px == Some(0) {
                         push_span(&mut out.hidden_rows, row);
+                    }
+                    if let Some(px) = px.filter(|p| *p > 0) {
+                        push_sized(&mut out.row_heights, row, px);
+                    }
+                    if level > 0 {
+                        push_sized(&mut out.row_levels, row, level);
                     }
                 }
                 "c" => {
@@ -458,6 +477,17 @@ fn shared_formula(f: &Node, at: (u32, u32), masters: &mut Masters, fixes: &mut V
             }
         }
     }
+}
+
+/// Row height in points → pixels at 96 dpi.
+fn pt_to_px(pt: f64) -> u32 {
+    (pt * 4.0 / 3.0).round() as u32
+}
+
+/// Column width in characters (Excel's unit, padding included) → pixels,
+/// for the default font's 7-pixel digits.
+fn chars_to_px(w: f64) -> u32 {
+    (w * 7.0).round() as u32
 }
 
 fn push_span(spans: &mut Vec<(u32, u32)>, i: u32) {
@@ -530,6 +560,14 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
         }
     }
     sh.hidden_rows = sx.hidden_rows;
+    // Sizes are kept where they differ from the sheet's defaults (Excel's are
+    // 15pt rows and 8.43-character columns).
+    let format = sx.nodes.iter().find(|n| n.name == "sheetFormatPr");
+    let size = |k: &str| format.and_then(|f| f.attr(k)).and_then(|v| v.parse::<f64>().ok());
+    let default_row = size("defaultRowHeight").map_or(20, pt_to_px);
+    let default_col = size("defaultColWidth").map_or(64, chars_to_px);
+    sh.row_heights = sx.row_heights.into_iter().filter(|h| h.2 != default_row).collect();
+    let mut col_levels = Vec::new();
     // Rules often cover whole columns; apply them only as far as the sheet has cells.
     let ext = sh.cells.iter().chain(&at.cells).fold((0u32, 0u32), |(r, c), x| (r.max(x.r), c.max(x.c)));
     let clamp = |rect: Rect| Rect { r1: rect.r1.min(ext.0.max(rect.r0)), c1: rect.c1.min(ext.1.max(rect.c0)), ..rect };
@@ -550,15 +588,27 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
                 sh.code_name = n.attr("codeName").map(str::to_string);
             }
             "sheetViews" => {
-                if let Some(p) = n.child("sheetView").and_then(|v| v.child("pane")).filter(|p| p.attr("state").is_some_and(|s| s.starts_with("frozen"))) {
+                let view = n.child("sheetView");
+                if let Some(p) = view.and_then(|v| v.child("pane")).filter(|p| p.attr("state").is_some_and(|s| s.starts_with("frozen"))) {
                     sh.frozen_rows = p.num("ySplit").unwrap_or(0);
                     sh.frozen_cols = p.num("xSplit").unwrap_or(0);
                 }
+                sh.no_gridlines = view.is_some_and(|v| matches!(v.attr("showGridLines"), Some("0" | "false")));
             }
             "cols" => {
-                for col in n.children("col").filter(|c| c.flag("hidden")) {
-                    if let (Some(a), Some(b)) = (col.num("min"), col.num("max")) {
-                        sh.hidden_cols.push((a.saturating_sub(1), b.saturating_sub(1)));
+                for col in n.children("col") {
+                    let (Some(a), Some(b)) = (col.num("min"), col.num("max")) else { continue };
+                    let (a, b) = (a.saturating_sub(1), b.saturating_sub(1));
+                    let px = col.attr("width").and_then(|w| w.parse::<f64>().ok()).filter(|w| *w >= 0.0).map(chars_to_px);
+                    // A column of width 0 is hidden too.
+                    if col.flag("hidden") || px == Some(0) {
+                        sh.hidden_cols.push((a, b));
+                    }
+                    if let Some(px) = px.filter(|p| *p > 0 && *p != default_col) {
+                        sh.col_widths.push((a, b, px));
+                    }
+                    if let Some(l) = col.num("outlineLevel").filter(|l| *l > 0) {
+                        col_levels.push((a, b, l));
                     }
                 }
             }
@@ -639,27 +689,37 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
         }
     }
 
+    sh.outlines = outlines(&sx.row_levels, &sh.hidden_rows, false);
+    sh.outlines.extend(outlines(&col_levels, &sh.hidden_cols, true));
+
     // Notes: legacy comments, replaced by threaded comments where a cell has them.
     let mut notes: BTreeMap<(u32, u32), String> = BTreeMap::new();
     for rel in rels.values().filter(|r| r.kind == "comments") {
         let Some(n) = pkg.node(&rel.target) else { continue };
+        let authors: Vec<String> = n.child("authors").map(|a| a.children("author").map(|x| x.text.trim().to_string()).collect()).unwrap_or_default();
         for c in n.all("comment") {
             if let Some(p) = c.attr("ref").and_then(cell_pos) {
-                notes.insert(p, c.runs().trim().to_string());
+                // Placeholders (`tc={…}`) stand for a threaded comment's author.
+                let author = c.attr("authorId").and_then(|i| authors.get(i.parse::<usize>().ok()?)).filter(|a| !a.starts_with("tc="));
+                notes.insert(p, signed(author.map(String::as_str), c.runs().trim()));
             }
         }
     }
-    let mut threads: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+    let mut threads: BTreeMap<(u32, u32), (Vec<String>, bool)> = BTreeMap::new();
     for rel in rels.values().filter(|r| r.kind == "threadedComment") {
         let Some(n) = pkg.node(&rel.target) else { continue };
         for c in n.all("threadedComment") {
             if let Some(p) = c.attr("ref").and_then(cell_pos) {
-                threads.entry(p).or_default().push(c.child("text").map(|t| t.text.trim().to_string()).unwrap_or_default());
+                let author = c.attr("personId").and_then(|id| cx.persons.get(id)).map(String::as_str);
+                let text = c.child("text").map(|t| t.text.trim().to_string()).unwrap_or_default();
+                let t = threads.entry(p).or_default();
+                t.0.push(signed(author, &text));
+                t.1 |= c.flag("done");
             }
         }
     }
-    for (p, msgs) in threads {
-        notes.insert(p, msgs.join("\n↳ "));
+    for (p, (msgs, done)) in threads {
+        notes.insert(p, format!("{}{}", msgs.join("\n↳ "), if done { "\n(resolved)" } else { "" }));
     }
     // Notes are few and say things nothing else does: keep them in summarized rows too.
     at.gap = None;
@@ -678,6 +738,15 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
     sh.cells.reserve_exact(at.cells.len());
     sh.cells.append(&mut at.cells);
     Ok(())
+}
+
+/// `Author: text`, unless the text already opens with the author's name
+/// (Excel writes `Author:` as a note's first line).
+fn signed(author: Option<&str>, text: &str) -> String {
+    match author.filter(|a| !a.is_empty()) {
+        Some(a) if !text.starts_with(a) => format!("{a}: {text}"),
+        _ => text.to_string(),
+    }
 }
 
 /// Cells `read_sheet` creates (styled blanks, notes, links...), kept apart and

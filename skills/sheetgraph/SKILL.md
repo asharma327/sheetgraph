@@ -41,7 +41,9 @@ Notation:
 - "typed arithmetic" (`=3820+3770`) is hand-entered data, not logic.
 - `▸ range table …` is a data block, one line per column: type and range, `enum` for small value sets, `fmt` for the number format, `ƒN` when computed.
 - `⋯ rows A–B summarized`: a very large sheet's middle rows are summarized per column, not kept.
-- Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`.
+- Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`, `[reads B8 inside merge A8:C8: blank]` (a formula pointing at a cell a merge hides: it always reads blank, usually a bug).
+- `[very hidden]` sheets can only be unhidden by macro code: someone meant them to stay out of sight. `Name (Calc only)` is a name local to one sheet; `(LAMBDA function)` names are custom functions defined in the workbook.
+- Formatting lines name cell styles (`style "Input"` marks intended inputs, `"Calculation"` computed cells) and borders (`border bottom double` is usually a totals line).
 - The lines under the title are file settings. `calculation: manual` means stored values may be stale; `iterative` means circular references are intended, not errors.
 - `▣` lines are pictures in cells and data types (stocks, places, people chips); `[image: …]` in a cell is a picture, not text. `✎ mixed formatting` shows runs as `[text]{bold fg#FF0000}`. `unlocked cells` are the inputs a protected sheet leaves editable.
 - Shape lines (`button "Run roll-up" at G9:H10 → runs RollUp`, `text box "…"`) are things drawn over the grid; text boxes often hold instructions.
@@ -51,7 +53,7 @@ Notation:
 
 ```bash
 sheetgraph cells  sheetgraph-out/<wb> "'Sheet Name'!A1:F20"   # exact values, formulas, formats
-sheetgraph trace  sheetgraph-out/<wb> "Summary!B4" --depth 3  # precedents and dependents
+sheetgraph trace  sheetgraph-out/<wb> "Summary!B4" --depth 3  # precedents and dependents, across extracted workbooks
 sheetgraph find   sheetgraph-out/<wb> "VAT"                   # search text, formulas, names and macro code
 sheetgraph macro  sheetgraph-out/<wb> RollUp                  # a macro's code (no name: every macro and what it touches)
 sheetgraph sheet  sheetgraph-out/<wb> "Ledger" --full         # one sheet's section, untruncated

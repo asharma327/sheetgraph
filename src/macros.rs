@@ -807,7 +807,7 @@ impl Scope<'_> {
                 [Tok::Str(s)] => match parse_rect(s) {
                     Some(r) => r,
                     None => {
-                        let Some(&(s, r)) = self.a.named.get(&s.to_ascii_uppercase()) else { return (None, None) };
+                        let Some((s, r)) = self.a.name_range(None, s) else { return (None, None) };
                         sheet = s.or(sheet);
                         r
                     }

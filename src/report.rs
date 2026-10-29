@@ -130,7 +130,9 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
     for (si, sh) in wb.sheets.iter().enumerate() {
         let sa = &a.sheets[si];
         let mut line = format!("{}. {}", si + 1, sh.name);
-        if sh.hidden {
+        if sh.very_hidden {
+            line.push_str(" [very hidden]");
+        } else if sh.hidden {
             line.push_str(" [hidden]");
         }
         if sh.kind != "GRID" {
@@ -163,18 +165,28 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         }
     }
 
-    // Cross-sheet references from charts, pivots, validations feed the map too.
+    // Cross-sheet references from charts, pivots, dropdowns and rules feed the map too.
     let mut other_links = Vec::new();
-    for sh in &wb.sheets {
+    for (si, sh) in wb.sheets.iter().enumerate() {
         for ch in &sh.charts {
             other_links.push(format!("chart \"{}\" on {} ← {}", trunc(&ch.title, 40), sh.name, ch.sources.join(", ")));
         }
         for p in &sh.pivots {
             other_links.push(format!("pivot at {}!{} ← {}", sh.name, crate::a1::cell_name(p.anchor.0, p.anchor.1), p.source));
         }
+        // Rules reading their own sheet show in that sheet's section.
+        for r in a.sheets[si].rules.iter().filter(|r| r.refs.iter().any(|x| x.sheet.is_some_and(|t| t != si))) {
+            let what = match r.kind {
+                "dropdown" => "dropdown",
+                "validation" => "validation",
+                _ => "conditional format",
+            };
+            let srcs: Vec<String> = r.refs.iter().filter(|x| x.sheet != Some(si)).map(|x| ref_text(wb, x)).collect();
+            other_links.push(format!("{what} on {}!{} ← {}", crate::a1::quote_sheet(&sh.name), rect_list(&r.ranges, 3), dedup_join(srcs)));
+        }
     }
     if !other_links.is_empty() {
-        let _ = writeln!(s, "\n## Charts & pivots");
+        let _ = writeln!(s, "\n## Charts, pivots & rules reading other sheets");
         for l in other_links.iter().take(30) {
             let _ = writeln!(s, "{l}");
         }
@@ -239,14 +251,41 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
     if !wb.named_ranges.is_empty() {
         let _ = writeln!(s, "\n## Named ranges");
         for n in &wb.named_ranges {
-            let _ = writeln!(s, "{} = {}", n.name, n.range);
+            let scope = n.scope.as_deref().and_then(|x| crate::analyze::sheet_index(wb, x));
+            let mut label = match n.name.strip_prefix("_xlnm.") {
+                Some("Print_Area") => "print area".to_string(),
+                Some("Print_Titles") => "print titles".to_string(),
+                Some(other) => other.to_string(),
+                None => n.name.clone(),
+            };
+            match (&n.scope, n.name.starts_with("_xlnm.")) {
+                (Some(sc), true) => {
+                    let _ = write!(label, " of {sc}");
+                }
+                (Some(sc), false) => {
+                    let _ = write!(label, " ({sc} only)");
+                }
+                _ => {}
+            }
+            if a.name(scope, &n.name).is_some_and(|d| d.lambda) {
+                label.push_str(" (LAMBDA function)");
+            }
+            let _ = writeln!(s, "{label} = {}", trunc(&n.range, 300));
         }
     }
 
     // Function census: custom first (they are code living outside the grid).
     if !a.custom_funcs.is_empty() {
         let _ = writeln!(s, "\n## Non-builtin functions (Apps Script custom functions, Named Functions, VBA UDFs, or LET/LAMBDA names)");
-        let _ = writeln!(s, "{}", a.custom_funcs.iter().map(|(f, n)| format!("{f} ({n})")).collect::<Vec<_>>().join(" · "));
+        let funcs: Vec<String> = a
+            .custom_funcs
+            .iter()
+            .map(|(f, n)| match a.names.get(f).is_some_and(|d| d.iter().any(|d| d.lambda)) {
+                true => format!("{f} ({n}, LAMBDA name)"),
+                false => format!("{f} ({n})"),
+            })
+            .collect();
+        let _ = writeln!(s, "{}", funcs.join(" · "));
     }
     if !a.func_cells.is_empty() {
         let mut v: Vec<_> = a.func_cells.iter().collect();
@@ -306,6 +345,56 @@ pub fn render(wb: &Workbook, a: &Analysis, o: &Opts) -> String {
         s.push_str(&render_sheet(wb, a, si, o));
     }
     s
+}
+
+/// `Sheet!A1:B2`, or the name the range was reached through.
+fn ref_text(wb: &Workbook, r: &crate::analyze::GRef) -> String {
+    let at = match r.sheet {
+        Some(t) => format!("{}!{}", crate::a1::quote_sheet(&wb.sheets[t].name), r.rect),
+        None => r.rect.a1(),
+    };
+    match &r.via_name {
+        Some(n) => format!("{n} ({at})"),
+        None => at,
+    }
+}
+
+fn dedup_join(mut v: Vec<String>) -> String {
+    let mut seen = HashSet::new();
+    v.retain(|x| seen.insert(x.clone()));
+    v.join(", ")
+}
+
+/// Merged ranges with repeats folded: `40× A:C, 1 row each, rows 8–86`.
+fn merge_summary(merges: &[Rect]) -> String {
+    let mut rest: Vec<Rect> = merges.to_vec();
+    let mut parts = Vec::new();
+    let cols = |c0: u32, c1: u32| if c0 == c1 { format!("column {}", col_name(c0)) } else { format!("{}:{}", col_name(c0), col_name(c1)) };
+    let rows = |r0: u32, r1: u32| if r0 == r1 { format!("row {}", r0 + 1) } else { format!("rows {}–{}", r0 + 1, r1 + 1) };
+    // Same columns and height, down the sheet (labels merged across a column group).
+    let mut by: BTreeMap<(u32, u32, u64), Vec<Rect>> = BTreeMap::new();
+    for m in &rest {
+        by.entry((m.c0, m.c1, m.rows())).or_default().push(*m);
+    }
+    for ((c0, c1, h), ms) in by.into_iter().filter(|(_, ms)| ms.len() >= 3) {
+        let (lo, hi) = (ms.iter().map(|m| m.r0).min().unwrap_or(0), ms.iter().map(|m| m.r1).max().unwrap_or(0));
+        parts.push(format!("{}× {}, {h} row{} each, {}", ms.len(), cols(c0, c1), if h == 1 { "" } else { "s" }, rows(lo, hi)));
+        rest.retain(|m| !ms.contains(m));
+    }
+    // Same rows and width, across the sheet (period headers over each column group).
+    let mut by: BTreeMap<(u32, u32, u64), Vec<Rect>> = BTreeMap::new();
+    for m in &rest {
+        by.entry((m.r0, m.r1, m.cols())).or_default().push(*m);
+    }
+    for ((r0, r1, w), ms) in by.into_iter().filter(|(_, ms)| ms.len() >= 3) {
+        let (lo, hi) = (ms.iter().map(|m| m.c0).min().unwrap_or(0), ms.iter().map(|m| m.c1).max().unwrap_or(0));
+        parts.push(format!("{}× {w} column{} wide over {}, {}", ms.len(), if w == 1 { "" } else { "s" }, rows(r0, r1), cols(lo, hi)));
+        rest.retain(|m| !ms.contains(m));
+    }
+    if !rest.is_empty() {
+        parts.push(rect_list(&rest, 5));
+    }
+    parts.join("; ")
 }
 
 /// File-level settings that change how the workbook behaves or reads.
@@ -436,7 +525,9 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
         }
         None => head.push_str(" · empty"),
     }
-    if sh.hidden {
+    if sh.very_hidden {
+        head.push_str(" · very hidden (only macro code can unhide it)");
+    } else if sh.hidden {
         head.push_str(" · hidden");
     }
     if sh.frozen_rows + sh.frozen_cols > 0 {
@@ -595,7 +686,7 @@ pub fn render_sheet(wb: &Workbook, a: &Analysis, si: usize, o: &Opts) -> String 
     // ---- misc sheet features
     let mut misc = Vec::new();
     if !sh.merges.is_empty() {
-        misc.push(format!("merged: {}", rect_list(&sh.merges, 5)));
+        misc.push(format!("merged: {}", merge_summary(&sh.merges)));
     }
     for f in &sh.filters {
         let mut t = format!("filter{} {}", f.title.as_ref().map(|t| format!(" \"{t}\"")).unwrap_or_default(), f.range);
@@ -879,6 +970,10 @@ fn flags(g: &Group) -> String {
     if g.errors > 0 {
         let _ = write!(f, " [{} errors]", g.errors);
     }
+    if let Some(c) = &g.covered_eg {
+        let more = if g.covered > 1 { format!(" in {} cells", g.covered) } else { String::new() };
+        let _ = write!(f, " [reads {} inside merge {}: blank{more}]", crate::a1::cell_name(c.cell.0, c.cell.1), c.merge);
+    }
     f
 }
 
@@ -906,16 +1001,22 @@ fn validation_desc(v: &Validation) -> String {
 
 fn style_desc(st: &Style) -> String {
     let mut p = Vec::new();
+    if let Some(n) = &st.cell_style {
+        p.push(format!("style \"{n}\""));
+    }
     if let Some(b) = &st.bg {
         p.push(format!("bg{b}"));
     }
     if let Some(f) = &st.fg {
         p.push(format!("fg{f}"));
     }
-    for (on, name) in [(st.bold, "bold"), (st.italic, "italic"), (st.strike, "strike"), (st.underline, "underline"), (st.borders, "borders")] {
+    for (on, name) in [(st.bold, "bold"), (st.italic, "italic"), (st.strike, "strike"), (st.underline, "underline")] {
         if on {
             p.push(name.to_string());
         }
+    }
+    if let Some(b) = &st.border {
+        p.push(format!("border {b}"));
     }
     p.join(" ")
 }

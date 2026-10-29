@@ -3,6 +3,7 @@
 //! - families: groups whose formulas differ only in refs/numbers
 //! - blocks: connected regions of non-empty cells (tables, label clusters)
 //! - edges: group → referenced range, resolved to sheets / named ranges / externals
+//! - rules: dropdowns, validation and conditional formats, with the ranges they read
 
 use crate::a1::{parse_ref, Rect};
 use crate::formula::{self, call_args, lex, unquote, Lexed};
@@ -21,9 +22,40 @@ pub struct Analysis {
     pub func_cells: BTreeMap<String, u64>,
     /// References to sheets that do not exist in this workbook.
     pub broken_refs: BTreeMap<String, u64>,
-    pub named: HashMap<String, (Option<usize>, Rect)>,
+    /// Defined names and tables by upper-cased name: workbook-wide and
+    /// sheet-local definitions of the same name side by side.
+    pub names: HashMap<String, Vec<NameDef>>,
     /// Procedures in the workbook's macro / script modules.
     pub macros: Vec<crate::macros::Proc>,
+}
+
+/// What a defined name (or an Excel table) stands for.
+#[derive(Debug, Clone, Default)]
+pub struct NameDef {
+    /// As defined (names match case-insensitively).
+    pub name: String,
+    /// The sheet the name is local to; None when workbook-wide.
+    pub scope: Option<usize>,
+    /// The ranges it covers: its reference, or every range its formula reads
+    /// (through other names too). A None sheet is the sheet using the name.
+    pub targets: Vec<(Option<usize>, Rect)>,
+    /// Defined by a formula (a constant, an expression or a LAMBDA) rather
+    /// than a reference.
+    pub formula: bool,
+    pub lambda: bool,
+}
+
+impl Analysis {
+    /// The definition `n` has on sheet `si`: the sheet's own, else the workbook's.
+    pub fn name(&self, si: Option<usize>, n: &str) -> Option<&NameDef> {
+        let defs = self.names.get(&n.to_ascii_uppercase())?;
+        defs.iter().find(|d| d.scope.is_some() && d.scope == si).or_else(|| defs.iter().find(|d| d.scope.is_none()))
+    }
+
+    /// The single range a plain-reference name covers.
+    pub fn name_range(&self, si: Option<usize>, n: &str) -> Option<(Option<usize>, Rect)> {
+        self.name(si, n).filter(|d| !d.formula && d.targets.len() == 1).map(|d| d.targets[0])
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,6 +73,19 @@ pub struct SheetAnalysis {
     /// Sheet index this sheet is a structural clone of (same layout, other data).
     pub clone_of: Option<usize>,
     pub clone_similarity: f32,
+    /// Dropdowns, validation and conditional-format rules that read ranges.
+    pub rules: Vec<Rule>,
+}
+
+/// A dropdown, validation or conditional-format rule and what it reads.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    /// "dropdown" (choices from a range), "validation" (a formula), "cond_format"
+    pub kind: &'static str,
+    pub ranges: Vec<Rect>,
+    /// The rule as REPORT.md shows it.
+    pub desc: String,
+    pub refs: Vec<GRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +105,17 @@ pub struct Group {
     pub external: bool,
     /// No refs, names or functions: hand-typed arithmetic like `=3000+1577`.
     pub constant: bool,
+    /// Cells of the group whose formula reads a cell hidden under a merge
+    /// (blank: a merge keeps only its top-left cell), with the first such read.
+    pub covered: u32,
+    pub covered_eg: Option<CoveredRead>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoveredRead {
+    pub sheet: usize,
+    pub cell: (u32, u32),
+    pub merge: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -90,19 +146,6 @@ pub struct External {
 }
 
 pub fn analyze(wb: &Workbook) -> Analysis {
-    let mut named = HashMap::new();
-    for nr in &wb.named_ranges {
-        if let Some((sh, rect)) = parse_ref(&nr.range) {
-            let si = sh.as_deref().and_then(|s| sheet_index(wb, s));
-            named.insert(nr.name.to_ascii_uppercase(), (si, rect));
-        }
-    }
-    // Excel tables resolve like names: `Sales[Amount]` lexes as the name `Sales`.
-    for (si, sh) in wb.sheets.iter().enumerate() {
-        for t in &sh.tables {
-            named.entry(t.name.to_ascii_uppercase()).or_insert((Some(si), t.range));
-        }
-    }
     let mut a = Analysis {
         sheets: Vec::new(),
         sheet_edges: BTreeMap::new(),
@@ -110,7 +153,7 @@ pub fn analyze(wb: &Workbook) -> Analysis {
         custom_funcs: BTreeMap::new(),
         func_cells: BTreeMap::new(),
         broken_refs: BTreeMap::new(),
-        named,
+        names: names(wb),
         macros: Vec::new(),
     };
     for (si, sh) in wb.sheets.iter().enumerate() {
@@ -120,6 +163,70 @@ pub fn analyze(wb: &Workbook) -> Analysis {
     find_clones(wb, &mut a);
     a.macros = crate::macros::analyze(wb, &a);
     a
+}
+
+/// Every defined name and table. A name defined by a formula covers what the
+/// formula reads, other names included (resolved a few levels deep).
+fn names(wb: &Workbook) -> HashMap<String, Vec<NameDef>> {
+    let mut out: HashMap<String, Vec<NameDef>> = HashMap::new();
+    // (key, index in out[key], names its formula uses) for the second pass.
+    let mut pending: Vec<(String, usize, Vec<String>)> = Vec::new();
+    for nr in &wb.named_ranges {
+        let scope = nr.scope.as_deref().and_then(|s| sheet_index(wb, s));
+        let key = nr.name.to_ascii_uppercase();
+        let mut d = NameDef { name: nr.name.clone(), scope, ..Default::default() };
+        let mut uses = Vec::new();
+        match parse_ref(&nr.range) {
+            Some((sh, rect)) => d.targets.push((sh.as_deref().and_then(|s| sheet_index(wb, s)).or(scope), rect)),
+            None => {
+                let lx = lex(&nr.range);
+                d.formula = true;
+                d.lambda = lx.funcs.iter().any(|f| f.name == "LAMBDA");
+                for t in &lx.refs {
+                    let Some(r) = t.rect() else { continue };
+                    match &t.sheet {
+                        None => d.targets.push((scope, r)),
+                        Some(n) => d.targets.extend(sheet_span(wb, n).into_iter().map(|s| (Some(s), r))),
+                    }
+                }
+                uses = lx.names.iter().chain(lx.funcs.iter().map(|f| &f.name)).map(|n| n.to_ascii_uppercase()).filter(|n| *n != key).collect();
+            }
+        }
+        let defs = out.entry(key.clone()).or_default();
+        if !uses.is_empty() {
+            pending.push((key, defs.len(), uses));
+        }
+        defs.push(d);
+    }
+    // Excel tables resolve like names: `Sales[Amount]` lexes as the name `Sales`.
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        for t in &sh.tables {
+            out.entry(t.name.to_ascii_uppercase()).or_insert_with(|| vec![NameDef { name: t.name.clone(), targets: vec![(Some(si), t.range)], ..Default::default() }]);
+        }
+    }
+    for _ in 0..3 {
+        let mut changed = false;
+        for (key, i, uses) in &pending {
+            let scope = out[key][*i].scope;
+            let mut add = Vec::new();
+            for u in uses {
+                let Some(defs) = out.get(u) else { continue };
+                let d = defs.iter().find(|d| d.scope.is_some() && d.scope == scope).or_else(|| defs.iter().find(|d| d.scope.is_none()));
+                add.extend(d.into_iter().flat_map(|d| d.targets.iter().copied()));
+            }
+            let d = &mut out.get_mut(key).unwrap()[*i];
+            for t in add {
+                if !d.targets.contains(&t) {
+                    d.targets.push(t);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
 }
 
 /// Structural fingerprint: formula families (copied ≥2 cells, ignoring typed
@@ -299,6 +406,8 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
             spill: false,
             external: false,
             constant: lx.refs.is_empty() && lx.names.is_empty() && lx.funcs.is_empty(),
+            covered: 0,
+            covered_eg: None,
         };
         for fu in &g.funcs {
             g.dynamic |= formula::DYNAMIC_FUNCS.contains(&fu.as_str());
@@ -309,6 +418,7 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
         g.external |= !lx.books.is_empty();
         g.errors = cells_in(sh, &rect).filter(|c| matches!(c.v, Value::Err { .. })).count() as u32;
         g.refs = resolve_refs(wb, si, &lx, &rect, a);
+        covered_reads(wb, si, &lx, &mut g);
         let mut targets: Vec<usize> = g.refs.iter().filter_map(|r| r.sheet).filter(|t| *t != si).collect();
         targets.sort_unstable();
         targets.dedup();
@@ -333,7 +443,85 @@ fn analyze_sheet(wb: &Workbook, si: usize, sh: &Sheet, a: &mut Analysis) -> Shee
     }
 
     sa.blocks = find_blocks(sh);
+    sa.rules = rules(wb, si, sh, sa.used, a);
     sa
+}
+
+/// A merge shows its top-left cell over the whole range; every other cell in
+/// it is blank. Count the group's cells whose single-cell refs land on one.
+fn covered_reads(wb: &Workbook, si: usize, lx: &Lexed, g: &mut Group) {
+    let rect = g.rect;
+    let (dr, dc) = (rect.r1 as i64 - rect.r0 as i64, rect.c1 as i64 - rect.c0 as i64);
+    let mut hit = vec![false; (rect.area() as usize).min(1 << 16)];
+    for t in &lx.refs {
+        if t.rect_at(0, 0).is_none_or(|r| r.area() != 1) {
+            continue;
+        }
+        let sheets = match &t.sheet {
+            None => vec![si],
+            Some(n) => sheet_span(wb, n),
+        };
+        for ts in sheets {
+            let merges = &wb.sheets[ts].merges;
+            let (Some(a0), Some(a1)) = (t.rect_at(0, 0), t.rect_at(dr, dc)) else { continue };
+            let span = a0.union(&a1);
+            let near: Vec<&Rect> = merges.iter().filter(|m| m.area() > 1 && m.intersects(&span)).collect();
+            if near.is_empty() {
+                continue;
+            }
+            let cols = rect.cols() as usize;
+            for (i, h) in hit.iter_mut().enumerate() {
+                let Some(x) = t.rect_at((i / cols) as i64, (i % cols) as i64) else { continue };
+                if let Some(m) = near.iter().find(|m| m.contains(x.r0, x.c0) && (x.r0, x.c0) != (m.r0, m.c0)) {
+                    *h = true;
+                    g.covered_eg.get_or_insert(CoveredRead { sheet: ts, cell: (x.r0, x.c0), merge: **m });
+                }
+            }
+        }
+    }
+    g.covered = hit.iter().filter(|h| **h).count() as u32;
+}
+
+/// Dropdowns, validation formulas and conditional formats that read ranges.
+fn rules(wb: &Workbook, si: usize, sh: &Sheet, used: Option<Rect>, a: &Analysis) -> Vec<Rule> {
+    let mut out = Vec::new();
+    // Whole-column rules: only as far as the sheet has cells.
+    let clamp = |r: Rect| match used {
+        Some(u) => Rect { r1: r.r1.min(u.r1.max(r.r0)), c1: r.c1.min(u.c1.max(r.c0)), ..r },
+        None => r,
+    };
+    let dv_pts: Vec<(u32, u32, u32)> = sh.cells.iter().filter_map(|c| c.dv.map(|d| (d, c.r, c.c))).collect();
+    let mut by: BTreeMap<u32, Vec<Rect>> = BTreeMap::new();
+    for (d, r) in cover(dv_pts) {
+        by.entry(d).or_default().push(r);
+    }
+    for (d, ranges) in by {
+        let v = &wb.validations[d as usize];
+        let (kind, f) = match (v.kind.as_str(), v.values.first()) {
+            ("ONE_OF_RANGE", Some(f)) => ("dropdown", f),
+            (_, Some(f)) if f.starts_with('=') => ("validation", f),
+            _ => continue,
+        };
+        let f = if f.starts_with('=') { f.clone() } else { format!("={f}") };
+        let lx = lex(&f);
+        let bbox = ranges.iter().skip(1).fold(ranges[0], |b, r| b.union(r));
+        // A dropdown's list is one fixed range for every cell; a formula shifts.
+        let span = if kind == "dropdown" { Rect::cell(bbox.r0, bbox.c0) } else { bbox };
+        let refs = resolve_refs(wb, si, &lx, &span, a);
+        if !refs.is_empty() {
+            out.push(Rule { kind, desc: f, ranges, refs });
+        }
+    }
+    for cf in &sh.cond_formats {
+        let Some(first) = cf.ranges.first() else { continue };
+        let bbox = cf.ranges.iter().skip(1).fold(clamp(*first), |b, r| b.union(&clamp(*r)));
+        let span = Rect { r0: first.r0, c0: first.c0, ..bbox };
+        let refs: Vec<GRef> = cf.formulas.iter().flat_map(|f| resolve_refs(wb, si, &lex(f), &span, a)).collect();
+        if !refs.is_empty() {
+            out.push(Rule { kind: "cond_format", ranges: cf.ranges.clone(), desc: cf.rule.clone(), refs });
+        }
+    }
+    out
 }
 
 fn dedup(mut v: Vec<String>) -> Vec<String> {
@@ -360,9 +548,12 @@ fn resolve_refs(wb: &Workbook, si: usize, lx: &Lexed, rect: &Rect, a: &Analysis)
             out.push(GRef { sheet: Some(s), sheet_name: Some(n.clone()), rect, via_name: None });
         }
     }
-    for n in &lx.names {
-        if let Some((sh, r)) = a.named.get(&n.to_ascii_uppercase()) {
-            out.push(GRef { sheet: sh.or(Some(si)), sheet_name: None, rect: *r, via_name: Some(n.clone()) });
+    // Names, and functions defined as LAMBDA names (`=AddTax(10)`).
+    let lambdas = lx.funcs.iter().filter(|f| !formula::is_builtin(&f.name)).map(|f| &f.name);
+    for n in lx.names.iter().chain(lambdas) {
+        let Some(d) = a.name(Some(si), n) else { continue };
+        for (sh, r) in &d.targets {
+            out.push(GRef { sheet: sh.or(Some(si)), sheet_name: None, rect: *r, via_name: Some(d.name.clone()) });
         }
     }
     out

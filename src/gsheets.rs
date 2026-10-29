@@ -229,7 +229,7 @@ impl ExtValue {
 pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
     let id = crate::formula::spreadsheet_id(id_or_url);
     let meta_fields = "spreadsheetId,spreadsheetUrl,properties(title,locale,timeZone,autoRecalc,iterativeCalculationSettings),namedRanges,dataSources,developerMetadata,\
-        sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata)";
+        sheets(properties,merges,conditionalFormats,protectedRanges,basicFilter,filterViews,charts,bandedRanges,developerMetadata,slicers,tables)";
     let meta: J = serde_json::from_str(&auth.get(&format!("{SHEETS}/{id}"), &[("fields", meta_fields)])?)?;
 
     let mut wb = Workbook {
@@ -287,13 +287,21 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
             sh.merges.push(gr(m));
         }
         for cf in arr(&s["conditionalFormats"]) {
-            sh.cond_formats.push(CondFormat { ranges: arr(&cf["ranges"]).iter().map(gr).collect(), rule: cond_rule(cf) });
+            // Formula values (`=$C2>100`, `=Inputs!B2`) are what the rule reads.
+            let formulas = cond_values(&cf["booleanRule"]["condition"]).into_iter().filter(|v| v.starts_with('=')).collect();
+            sh.cond_formats.push(CondFormat { ranges: arr(&cf["ranges"]).iter().map(gr).collect(), rule: cond_rule(cf), formulas });
         }
         if s["basicFilter"].is_object() {
             sh.filters.push(filter(&s["basicFilter"], None));
         }
         for fv in arr(&s["filterViews"]) {
             sh.filters.push(filter(fv, fv["title"].as_str().map(Into::into)));
+        }
+        for sl in arr(&s["slicers"]) {
+            sh.filters.push(slicer(&sl["spec"]));
+        }
+        for t in arr(&s["tables"]) {
+            sh.tables.push(table(t));
         }
         for pr in arr(&s["protectedRanges"]) {
             sh.protected.push(Protected {
@@ -319,6 +327,7 @@ pub fn fetch(auth: &Auth, id_or_url: &str, verbose: bool) -> Result<Workbook> {
         wb.named_ranges.push(NamedRange {
             name: nr["name"].as_str().unwrap_or_default().into(),
             range: format!("{}!{}", quote_sheet(&sheet), grid_range(r)),
+            scope: None,
         });
     }
     wb.data_sources = arr(&meta["dataSources"]).to_vec();
@@ -540,7 +549,20 @@ fn style_of(f: &J) -> Style {
     let fg = color_of(&tf["foregroundColorStyle"], &tf["foregroundColor"]).filter(|c| c != "#000000");
     let font = tf["fontFamily"].as_str().filter(|f| *f != "Arial").map(Into::into);
     let size = tf["fontSize"].as_u64().map(|s| s as u32).filter(|s| *s != 10);
-    let borders = f["borders"].as_object().map(|b| b.values().any(|v| v["style"].as_str().is_some_and(|s| s != "NONE"))).unwrap_or(false);
+    // Line names as Excel's, so both sources read alike.
+    let sides: Vec<(&str, String)> = ["top", "bottom", "left", "right"]
+        .into_iter()
+        .filter_map(|k| {
+            let line = match f["borders"][k]["style"].as_str()? {
+                "NONE" => return None,
+                "SOLID" => "thin",
+                "SOLID_MEDIUM" => "medium",
+                "SOLID_THICK" => "thick",
+                other => return Some((k, other.to_ascii_lowercase())),
+            };
+            Some((k, line.to_string()))
+        })
+        .collect();
     Style {
         num_fmt: f["numberFormat"]["pattern"].as_str().map(Into::into),
         num_type: f["numberFormat"]["type"].as_str().map(Into::into),
@@ -550,7 +572,7 @@ fn style_of(f: &J) -> Style {
         italic: tf["italic"].as_bool().unwrap_or(false),
         strike: tf["strikethrough"].as_bool().unwrap_or(false),
         underline: tf["underline"].as_bool().unwrap_or(false),
-        borders,
+        border: crate::model::border_desc(&sides),
         h_align: f["horizontalAlignment"].as_str().filter(|a| *a != "LEFT").map(Into::into),
         font,
         size,
@@ -677,22 +699,39 @@ fn cond_rule(cf: &J) -> String {
 }
 
 fn filter(f: &J, title: Option<String>) -> Filter {
-    let mut criteria = Vec::new();
-    for spec in arr(&f["filterSpecs"]) {
-        let col = spec["columnIndex"].as_u64().unwrap_or(0) as u32;
-        let c = &spec["filterCriteria"];
-        let mut bits = Vec::new();
-        if let Some(h) = c["hiddenValues"].as_array() {
-            bits.push(format!("hide {} values", h.len()));
-        }
-        if c["condition"].is_object() {
-            bits.push(format!("{} {}", c["condition"]["type"].as_str().unwrap_or("?"), cond_values(&c["condition"]).join(",")));
-        }
-        if !bits.is_empty() {
-            criteria.push(format!("{}: {}", col_name(col), bits.join("; ")));
-        }
-    }
+    let criteria = arr(&f["filterSpecs"]).iter().filter_map(|spec| criterion(spec["columnIndex"].as_u64().unwrap_or(0) as u32, &spec["filterCriteria"])).collect();
     Filter { range: grid_range(&f["range"]), title, criteria }
+}
+
+/// One column's filter criteria, e.g. `C: hide 3 values`.
+fn criterion(col: u32, c: &J) -> Option<String> {
+    let mut bits = Vec::new();
+    if let Some(h) = c["hiddenValues"].as_array() {
+        bits.push(format!("hide {} values", h.len()));
+    }
+    if c["condition"].is_object() {
+        bits.push(format!("{} {}", c["condition"]["type"].as_str().unwrap_or("?"), cond_values(&c["condition"]).join(",")));
+    }
+    (!bits.is_empty()).then(|| format!("{}: {}", col_name(col), bits.join("; ")))
+}
+
+/// A slicer is a filter control on one column of a range.
+fn slicer(spec: &J) -> Filter {
+    let range = grid_range(&spec["dataRange"]);
+    let col = range.c0 + spec["columnIndex"].as_u64().unwrap_or(0) as u32;
+    let title = spec["title"].as_str().filter(|t| !t.is_empty()).map_or_else(|| format!("slicer on {}", col_name(col)), |t| format!("slicer {t}"));
+    Filter { range, title: Some(title), criteria: criterion(col, &spec["filterCriteria"]).into_iter().collect() }
+}
+
+/// A Google Sheets table (Format → Convert to table).
+fn table(t: &J) -> Table {
+    Table {
+        name: t["name"].as_str().unwrap_or_default().into(),
+        range: grid_range(&t["range"]),
+        columns: arr(&t["columnProperties"]).iter().map(|c| c["columnName"].as_str().unwrap_or_default().to_string()).collect(),
+        // The API doesn't say whether the last row is a totals row.
+        totals: false,
+    }
 }
 
 fn chart(c: &J, id_to_name: &HashMap<i64, String>) -> Chart {
@@ -782,5 +821,30 @@ mod tests {
         assert_eq!(calc(&json!({"autoRecalc": "ON_CHANGE"})), None);
         let c = calc(&json!({"autoRecalc": "HOUR", "iterativeCalculationSettings": {"maxIterations": 50, "convergenceThreshold": 0.01}})).unwrap();
         assert_eq!((c.mode.as_str(), c.iterative, c.max_iterations, c.max_change), ("on change and every hour", true, Some(50), Some(0.01)));
+    }
+
+    #[test]
+    fn borders_slicers_and_tables() {
+        let st = style_of(&json!({"borders": {"top": {"style": "SOLID"}, "bottom": {"style": "DOUBLE"}, "left": {"style": "NONE"}}}));
+        assert_eq!(st.border.as_deref(), Some("top thin, bottom double"));
+        let all = json!({"style": "SOLID_MEDIUM"});
+        assert_eq!(style_of(&json!({"borders": {"top": all, "bottom": all, "left": all, "right": all}})).border.as_deref(), Some("box medium"));
+
+        let sl = slicer(&json!({
+            "dataRange": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 50, "startColumnIndex": 1, "endColumnIndex": 5},
+            "columnIndex": 2, "title": "Region",
+            "filterCriteria": {"hiddenValues": ["East", "West"]},
+        }));
+        assert_eq!((sl.range.a1(), sl.title.as_deref(), sl.criteria.as_slice()), ("B1:E50".to_string(), Some("slicer Region"), ["D: hide 2 values".to_string()].as_slice()));
+
+        let t = table(&json!({
+            "tableId": "t1", "name": "Orders",
+            "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 10, "startColumnIndex": 0, "endColumnIndex": 2},
+            "columnProperties": [{"columnIndex": 0, "columnName": "Order"}, {"columnIndex": 1, "columnName": "Amount", "columnType": "CURRENCY"}],
+        }));
+        assert_eq!((t.name.as_str(), t.range.a1(), t.columns.as_slice()), ("Orders", "A1:B10".to_string(), ["Order".to_string(), "Amount".to_string()].as_slice()));
+
+        let cond = json!({"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": "=$C2>Inputs!B1"}]});
+        assert_eq!(cond_values(&cond), ["=$C2>Inputs!B1"]);
     }
 }

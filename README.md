@@ -102,7 +102,7 @@ sheetgraph extract <id|url|file.xlsx>... -o sheetgraph-out --creds service-accou
 
 # drill down (all read workbook.json.gz; no network)
 sheetgraph cells  sheetgraph-out/<wb> "'Revenue Input'!A1:F20"
-sheetgraph trace  sheetgraph-out/<wb> "Monthly!E10" --depth 3   # precedents + dependents
+sheetgraph trace  sheetgraph-out/<wb> "Monthly!E10" --depth 3   # precedents + dependents, into other extracted workbooks too
 sheetgraph find   sheetgraph-out/<wb> "VAT"                      # values, formulas, notes, macro code
 sheetgraph macro  sheetgraph-out/<wb> [Module1 | RollUp]         # macros and what they touch; code with a name
 sheetgraph sheet  sheetgraph-out/<wb> "Ledger" --full           # untruncated section
@@ -127,18 +127,18 @@ let graph = sheetgraph::graph::build(&wb, &a); // serde_json::Value
 sheetgraph-out/
   INDEX.md                    every workbook, sizes, links between workbooks (IMPORTRANGE, Excel external links)
   <workbook>/REPORT.md        the map: read this first
-  <workbook>/graph.json       nodes (sheets, blocks, formula groups, charts, pivots, externals, macros) + edges
+  <workbook>/graph.json       nodes (sheets, blocks, formula groups, charts, pivots, dropdowns and rules, names, externals, macros) + edges
   <workbook>/workbook.json.gz every cell (see Known gaps for very large files): value, formula, display text, style, validation, note, link
   <workbook>/meta.json
 ```
 
-REPORT.md contains, per workbook: sheet list with used ranges and sheet→sheet data flow; external links (IMPORTRANGE / IMPORTDATA / … with targets resolved from cells, Excel links to other workbooks, refs to deleted sheets, Connected-Sheets data sources); named ranges; function census incl. **non-builtin functions** (Apps Script custom functions / Named Functions / VBA UDFs), dynamic refs (INDIRECT/OFFSET) and volatile functions; scripts (VBA modules from xlsm; Apps Script on request), with each procedure's trigger (`Workbook_Open`, `Worksheet_Change`, `onEdit`), the sheets and ranges it writes and uses, the procedures it calls, and the formula cells that call it as a function; modules with no code (the empty one Excel gives every sheet) are counted, not listed; developer metadata (left by add-ons/integrations).
+REPORT.md contains, per workbook: sheet list with used ranges and sheet→sheet data flow; external links (IMPORTRANGE / IMPORTDATA / … with targets resolved from cells, Excel links to other workbooks, refs to deleted sheets, Connected-Sheets data sources); dropdowns, validation and conditional formats that read another sheet; named ranges, with the sheet a local name belongs to and which names are LAMBDA functions; function census incl. **non-builtin functions** (Apps Script custom functions / Named Functions / VBA UDFs), dynamic refs (INDIRECT/OFFSET) and volatile functions; scripts (VBA modules from xlsm; Apps Script on request), with each procedure's trigger (`Workbook_Open`, `Worksheet_Change`, `onEdit`), the sheets and ranges it writes and uses, the procedures it calls, and the formula cells that call it as a function; modules with no code (the empty one Excel gives every sheet) are counted, not listed; developer metadata (left by add-ons/integrations).
 
 REPORT.md also starts with what changes how the whole file behaves: document properties, calculation mode (manual calculation means stored values may be stale; iterative means circular references are intended), a locked sheet structure, and data connections and Power Query code.
 
-graph.json edges: `reads` (formula group → the blocks and groups its references land on), `plots` (chart → source), `summarizes` (pivot → source), `imports` (formula → external workbook or URL), `writes` / `uses` (macro → what it changes or reads; a sheet the macro creates has `"to": null` and `missing_sheet`), `calls` (macro → macro, and formula group → the VBA function it calls), `runs` (button or shape → the macro it runs), and `writes` from a form control to its linked cell.
+graph.json edges: `reads` (formula group → the blocks and groups its references land on), `plots` (chart → source), `summarizes` (pivot → source), `imports` (formula → external workbook or URL), `writes` / `uses` (macro → what it changes or reads; a sheet the macro creates has `"to": null` and `missing_sheet`), `calls` (macro → macro, and formula group → the VBA function it calls), `runs` (button or shape → the macro it runs), `writes` from a form control to its linked cell, `choices` (dropdown → the range its list comes from), and `reads` from validation and conditional-format rules and from names defined by a formula (LAMBDA included) to what they read. A formula reading a name defined by a formula gets `reads` edges to what that formula reads, with `via` naming it; a name local to one sheet is the node `name:Sheet!Name`.
 
-Per sheet: blocks (tables with column profiles + samples, or small blocks verbatim), formula copy-groups and families with flags (`[array/spills]`, `[external]`, `[dynamic ref]`, `[#REF!]`, error counts), data validation (dropdowns, checkboxes, range-sourced lists), conditional formats, visual formatting regions, merges, filters/filter views, protected ranges, hidden rows/cols, banding, Excel tables, charts and pivots (with source ranges), pictures, shapes, text boxes and buttons over the grid (with their text and the macro they run), pictures in cells and data types (Excel Stocks/Geography, Google people and file chips), text with mixed formatting, unlocked input cells and hidden formulas, notes and comments, hyperlinks.
+Per sheet: blocks (tables with column profiles + samples, or small blocks verbatim), formula copy-groups and families with flags (`[array/spills]`, `[external]`, `[dynamic ref]`, `[#REF!]`, error counts, reads of a cell hidden under a merge), data validation (dropdowns, checkboxes, range-sourced lists), conditional formats, visual formatting regions (with named cell styles such as "Input" and which sides have a border), merges (repeats folded into patterns), filters/filter views and slicers, protected ranges, hidden rows/cols, banding, Excel tables, charts and pivots (with source ranges), pictures, shapes, text boxes and buttons over the grid (with their text and the macro they run), pictures in cells and data types (Excel Stocks/Geography, Google people and file chips), text with mixed formatting, unlocked input cells and hidden formulas, notes and comments, hyperlinks.
 
 ## Giving it to an AI agent
 
@@ -149,6 +149,7 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 - "typed arithmetic" is hand-entered sums like `=3820+3770`: data entry, not logic.
 - `▸ range table …` is a data block, one line per column: type and range, `enum` for small value sets, `fmt` for the number format, `ƒN` when the column is computed.
 - "same layout as X" means a sheet is a structural clone of an earlier one with different data; `sheetgraph sheet <dir> "<name>" --full` shows it in full.
+- `[reads B8 inside merge A8:C8: blank]` flags a formula pointing at a cell a merge hides: it always reads blank, usually a mistake for the merge's top-left cell.
 - `⋯ rows A–B summarized` means a very large sheet's middle rows were summarized per column rather than kept: the column profiles still count every row, but sample rows and `cells` don't show those rows.
 - Flags: `[external]` another file, `[dynamic ref]` INDIRECT/OFFSET (graph edges incomplete), `[array/spills]`, `[#REF!]`, `[N errors]`.
 - Under Scripts, `RollUp: writes Summary!A1:B1,B2:B5 · uses Data!E10,… · calls Totals` is one procedure. `,…` means it also reaches cells whose address is built at run time (`Cells(i, 2)`); `(not in file)` is a sheet the macro creates; `ActiveSheet` is whichever sheet is active when it runs. `sheetgraph macro <dir> RollUp` prints its code.
@@ -163,7 +164,7 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 | `ooxml` | xlsx/xlsm package parts calamine skips: styles, validation, conditional formats, comments, hyperlinks, frozen/hidden rows and cols, filters, protection, tables, charts, pivots, external workbook links, rich text, pictures and data types in cells, shapes and form controls, document properties, calculation settings, connections, Power Query |
 | `numfmt` | Excel number formats applied to numbers (`25%`, `$12.50`) |
 | `formula` | reference lexer (quoted and non-English sheet names, open-ended `A2:A`, whole rows/cols, `'[Book.xlsx]Sheet'`), R1C1 keys, function census |
-| `analyze` | copy-groups, families, blocks, cross-sheet edges, externals |
+| `analyze` | copy-groups, families, blocks, cross-sheet edges, externals, names, dropdown and rule refs |
 | `macros` | VBA / Apps Script procedures: triggers, sheets and ranges each writes and uses, calls |
 | `report` | REPORT.md |
 | `graph` | graph.json |
@@ -173,7 +174,7 @@ Point the agent at `INDEX.md`, then the `REPORT.md` it needs, and let it run the
 ## Known gaps
 
 - **Apps Script / macros / add-ons on Google Sheets**: the Sheets API doesn't expose bound scripts, installed add-ons or triggers, and the Apps Script API doesn't work with service accounts. `--apps-script <scriptId>` fetches a project with user OAuth (scope `script.projects.readonly`). Custom functions are still detected from formulas.
-- **Local files**: xlsx/xlsm get the same coverage as Google Sheets, plus Excel tables, links to other workbooks (`'[Budget.xlsx]Data'!B2`), shapes and pictures, connections and Power Query. Sparklines, slicers and ActiveX controls aren't read (the report says when a file has them). xls, xlsb and ods get values, formulas, names and merges only.
+- **Local files**: xlsx/xlsm get the same coverage as Google Sheets, plus Excel tables, links to other workbooks (`'[Budget.xlsx]Data'!B2`), shapes and pictures, connections and Power Query. Sparklines, Excel slicers and ActiveX controls aren't read (the report says when a file has them). xls, xlsb and ods get values, formulas, names and merges only.
 - **Pictures on Google Sheets**: the Sheets API doesn't return pictures placed over the grid or inserted into cells (an `=IMAGE()` formula is kept).
 - Number-format display text covers the common formats (percent, currency, thousands, decimals, scientific, sections); fractions, conditional sections and formats that mix digits with literals (`000-00-0000`) show the plain value. The format itself is on every cell.
 - Spill ranges of array formulas are flagged on the formula but the spilled cells look like plain values.

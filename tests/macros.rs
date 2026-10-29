@@ -132,7 +132,7 @@ fn resolution_patterns() {
     let vba = |name: &str, source: &str| Script { kind: "vba".into(), name: name.into(), source: source.into() };
     let wb = Workbook {
         sheets: vec![sheet("Raw Data", "Sheet1"), sheet("Calc", "shCalc")],
-        named_ranges: vec![NamedRange { name: "TaxRate".into(), range: "Calc!$B$2".into() }],
+        named_ranges: vec![NamedRange { name: "TaxRate".into(), range: "Calc!$B$2".into(), scope: None }],
         scripts: vec![
             vba(
                 "Module1",

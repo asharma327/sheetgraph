@@ -178,7 +178,8 @@ fn main() -> Result<()> {
             let wb = store::load(&dir)?;
             let a = analyze::analyze(&wb);
             let (u, d) = if !up && !down { (true, true) } else { (up, down) };
-            emit(&query::trace(&wb, &a, &cell, depth, u, d)?)?;
+            let books = store::Siblings::of(&dir);
+            emit(&query::trace(&wb, &a, &cell, depth, u, d, Some(&books))?)?;
         }
         Cmd::Find { dir, text, limit } => {
             let wb = store::load(&dir)?;

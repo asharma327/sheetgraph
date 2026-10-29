@@ -8,7 +8,7 @@
 
 use crate::a1::{col_name, parse_pt, parse_rect, quote_sheet, Rect, OPEN};
 use crate::model::{fmt_num, Value, 
-    Calc, Cell, CellObject, Chart, CondFormat, Connection, ExternalLink, Filter, Interner, Pivot, Protected, Run, Script, Shape, Sheet, Style,
+    Calc, Cell, CellObject, Chart, CondFormat, Connection, ExternalLink, Filter, Interner, NamedRange, Pivot, Protected, Run, Script, Shape, Sheet, Style,
     Table, Validation, Workbook,
 };
 use anyhow::{anyhow, Result};
@@ -40,6 +40,10 @@ pub fn enrich(path: &Path, wb: &mut Workbook) -> Result<()> {
     let objects = rich_values(&mut pkg);
 
     wb.external_links = external_links(&mut pkg, &root, &rels);
+    // calamine drops which sheet a name belongs to; read the names again.
+    if let Some(names) = defined_names(&root) {
+        wb.named_ranges = names;
+    }
     wb.calc = calc(&root);
     wb.structure_locked = root.child("workbookProtection").is_some_and(|p| p.flag("lockStructure"));
     wb.properties = properties(&mut pkg);
@@ -567,7 +571,7 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
             "conditionalFormatting" => {
                 let ranges = sqref(n.attr("sqref").unwrap_or(""));
                 for rule in n.children("cfRule") {
-                    sh.cond_formats.push(CondFormat { ranges: ranges.clone(), rule: cf_rule(rule, cx.styles) });
+                    sh.cond_formats.push(CondFormat { ranges: ranges.clone(), rule: cf_rule(rule, cx.styles), formulas: cf_formulas(rule) });
                 }
             }
             "hyperlinks" => {
@@ -624,7 +628,7 @@ fn read_sheet(pkg: &mut Pkg, part: &str, kind: &str, sh: &mut Sheet, cx: &mut Sh
                 for cf in n.all("conditionalFormatting") {
                     let ranges = sqref(&cf.child("sqref").map(|s| s.text.clone()).unwrap_or_default());
                     for rule in cf.children("cfRule").filter(|r| !r.attr("id").is_some_and(|id| main_ids.iter().any(|m| m == id))) {
-                        sh.cond_formats.push(CondFormat { ranges: ranges.clone(), rule: cf_rule(rule, cx.styles) });
+                        sh.cond_formats.push(CondFormat { ranges: ranges.clone(), rule: cf_rule(rule, cx.styles), formulas: cf_formulas(rule) });
                     }
                 }
                 if !n.all("sparklineGroup").is_empty() {
@@ -762,7 +766,7 @@ fn validation(n: &Node, f1: Option<String>, f2: Option<String>) -> Option<Valida
             Some(f) => ("ONE_OF_RANGE".to_string(), vec![f.replace('$', "")]),
             None => ("ONE_OF_LIST".to_string(), Vec::new()),
         },
-        "custom" => ("CUSTOM_FORMULA".to_string(), f1.map(|f| format!("={f}")).into_iter().collect()),
+        "custom" => ("CUSTOM_FORMULA".to_string(), f1.map(|f| format!("={}", f.trim_start_matches('='))).into_iter().collect()),
         "whole" | "decimal" | "date" | "time" | "textLength" => {
             let pre = match ty {
                 "whole" => "WHOLE_NUMBER",
@@ -803,6 +807,11 @@ fn validation(n: &Node, f1: Option<String>, f2: Option<String>) -> Option<Valida
         values,
         help,
     })
+}
+
+/// A rule's formulas (`<formula>`, or `<xm:f>` in x14 rules), as `=…`.
+fn cf_formulas(rule: &Node) -> Vec<String> {
+    rule.kids.iter().filter(|k| k.name == "formula" || k.name == "f").map(|k| format!("={}", k.text.trim().trim_start_matches('='))).collect()
 }
 
 fn cf_rule(rule: &Node, st: &Styles) -> String {
@@ -1237,6 +1246,26 @@ fn pivot(pkg: &mut Pkg, part: &str) -> Option<Pivot> {
 
 // ---------------------------------------------------------------- workbook settings
 
+/// Defined names with their scope (`localSheetId` counts sheets in
+/// workbook order). `_FilterDatabase` is Excel's hidden name for every autofilter.
+fn defined_names(root: &Node) -> Option<Vec<NamedRange>> {
+    let sheets: Vec<&str> = root.child("sheets")?.children("sheet").filter_map(|s| s.attr("name")).collect();
+    let names = root.child("definedNames")?;
+    Some(
+        names
+            .children("definedName")
+            .filter_map(|n| {
+                let name = n.attr("name")?;
+                (!name.ends_with("_FilterDatabase")).then(|| NamedRange {
+                    name: name.to_string(),
+                    range: n.text.trim().trim_start_matches('=').to_string(),
+                    scope: n.num("localSheetId").and_then(|i| sheets.get(i as usize)).map(|s| s.to_string()),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn calc(root: &Node) -> Option<Calc> {
     let c = root.child("calcPr")?;
     let mode = match c.attr("calcMode") {
@@ -1605,6 +1634,13 @@ impl Styles {
         let (def_name, def_size) = (val(fonts.first().copied(), "name"), val(fonts.first().copied(), "sz"));
 
         let mut st = Styles { xfs: Vec::new(), dxfs: Vec::new(), colors, fmts, def_font: (def_name.clone(), def_size.clone()) };
+        // Named styles that say what a cell is for, by their cellStyleXfs index.
+        let style_names: HashMap<u32, &str> = list("cellStyles", "cellStyle")
+            .into_iter()
+            .filter_map(|c| Some((c.num("xfId")?, c.attr("name")?, c.num("builtinId"))))
+            .filter(|(_, name, builtin)| meaningful_style(name, *builtin))
+            .map(|(i, name, _)| (i, name))
+            .collect();
         for xf in list("cellXfs", "xf") {
             let id = |k: &str| xf.num(k).unwrap_or(0) as usize;
             let font = fonts.get(id("fontId")).copied();
@@ -1615,12 +1651,13 @@ impl Styles {
                 num_type: num_fmt.as_deref().and_then(num_type).map(String::from),
                 num_fmt,
                 bg: fills.get(id("fillId")).and_then(|f| st.fill_color(f)).filter(|c| c != "#FFFFFF"),
-                borders: borders.get(id("borderId")).is_some_and(|b| b.kids.iter().any(|s| s.attr("style").is_some_and(|v| v != "none"))),
+                border: borders.get(id("borderId")).and_then(|b| border_sides(b)),
                 h_align: align.and_then(|a| a.attr("horizontal")).filter(|h| !matches!(*h, "general" | "left")).map(|h| h.to_ascii_uppercase()),
                 wrap: align.is_some_and(|a| a.flag("wrapText")),
                 // Cells are locked unless `locked="0"`; formulas show unless `hidden="1"`.
                 unlocked: prot.is_some_and(|p| matches!(p.attr("locked"), Some("0" | "false"))),
                 hidden_formula: prot.is_some_and(|p| p.flag("hidden")),
+                cell_style: xf.num("xfId").and_then(|i| style_names.get(&i)).map(|n| n.to_string()),
                 ..font.map(|f| st.font_style(f)).unwrap_or_default()
             });
         }
@@ -1674,6 +1711,33 @@ impl Styles {
         }
         out.join(" ")
     }
+}
+
+/// Whether a named cell style tells a reader what the cell is for: Input,
+/// Calculation, Note, Total, Good/Bad, headings, or a custom style. Normal, the
+/// number-format styles (Comma, Percent, Currency), Hyperlink and the accent
+/// fills don't, nor do the copies Excel makes when pasting between workbooks
+/// ("Normal 2", "Comma_Sheet1").
+fn meaningful_style(name: &str, builtin: Option<u32>) -> bool {
+    if let Some(id) = builtin {
+        // Note, Warning Text, Title, Heading 1–4, Input … Neutral, Explanatory Text.
+        return matches!(id, 10 | 11 | 15..=28 | 53);
+    }
+    let n = name.to_ascii_lowercase();
+    !(["normal", "comma", "currency", "percent", "hyperlink", "followed hyperlink"].iter().any(|b| n.starts_with(b)) || n.contains("accent"))
+}
+
+/// A `<border>`'s sides and their line style (diagonals left out).
+fn border_sides(b: &Node) -> Option<String> {
+    let sides: Vec<(&str, String)> = ["top", "bottom", "left", "right"]
+        .into_iter()
+        .filter_map(|k| {
+            // `start`/`end` are the newer names for left/right.
+            let n = b.child(k).or_else(|| b.child(match k { "left" => "start", "right" => "end", _ => k }))?;
+            n.attr("style").filter(|v| *v != "none").map(|v| (k, v.to_string()))
+        })
+        .collect();
+    crate::model::border_desc(&sides)
 }
 
 /// A boolean font property: `<b/>` is on, `<b val="0"/>` is off.

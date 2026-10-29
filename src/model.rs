@@ -66,6 +66,9 @@ pub struct Sheet {
     pub index: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// Hidden so that only macro code can unhide it (Excel `veryHidden`); also `hidden`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub very_hidden: bool,
     /// GRID, OBJECT (chart sheet), DATA_SOURCE
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
@@ -319,8 +322,10 @@ pub struct Style {
     pub strike: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub borders: bool,
+    /// Which sides have a border and its line: `box thin`, `bottom double`,
+    /// `top thin, bottom double`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h_align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,6 +340,28 @@ pub struct Style {
     /// The formula is hidden from the formula bar when the sheet is protected.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden_formula: bool,
+    /// Named cell style other than Normal ("Input", "Calculation", "Good", a custom one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_style: Option<String>,
+}
+
+/// `box thin` when all four sides share a line, else the sides grouped by
+/// line: `top thin, bottom double`. None without any side.
+pub fn border_desc(sides: &[(&str, String)]) -> Option<String> {
+    if sides.is_empty() {
+        return None;
+    }
+    if sides.len() == 4 && sides.iter().all(|(_, l)| *l == sides[0].1) {
+        return Some(format!("box {}", sides[0].1));
+    }
+    let mut groups: Vec<(Vec<&str>, &str)> = Vec::new();
+    for (side, line) in sides {
+        match groups.iter_mut().find(|(_, l)| l == line) {
+            Some(g) => g.0.push(side),
+            None => groups.push((vec![side], line)),
+        }
+    }
+    Some(groups.iter().map(|(s, l)| format!("{} {l}", s.join("+"))).collect::<Vec<_>>().join(", "))
 }
 
 impl Style {
@@ -364,8 +391,12 @@ pub struct Validation {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NamedRange {
     pub name: String,
-    /// A1 reference including sheet, e.g. `'Revenue Input'!A1:R100`.
+    /// A1 reference including sheet, e.g. `'Revenue Input'!A1:R100`, or the
+    /// formula a name stands for (a constant, an expression, a LAMBDA).
     pub range: String,
+    /// The sheet a name is local to; None for workbook-wide names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -373,6 +404,10 @@ pub struct CondFormat {
     pub ranges: Vec<Rect>,
     /// Human-readable rule, e.g. `NUMBER_LESS 0 → fg#FF0000` or `=$C2>100 → bg#F4CCCC`.
     pub rule: String,
+    /// Formulas the rule evaluates, each with a leading `=`, relative to the
+    /// top-left cell of the first range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formulas: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

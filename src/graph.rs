@@ -26,7 +26,7 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
     for (si, sh) in wb.sheets.iter().enumerate() {
         let sa = &a.sheets[si];
         nodes.push(json!({
-            "id": format!("s{}", si + 1), "type": "sheet", "name": sh.name, "hidden": sh.hidden,
+            "id": format!("s{}", si + 1), "type": "sheet", "name": sh.name, "hidden": sh.hidden, "very_hidden": sh.very_hidden,
             "used": sa.used.map(|u| u.a1()), "cells": sa.n_cells, "formulas": sa.n_formulas,
         }));
         for (bi, b) in sa.blocks.iter().enumerate() {
@@ -37,7 +37,7 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
         }
         for (gi, g) in sa.groups.iter().enumerate() {
             let mut flags = Vec::new();
-            for (on, name) in [(g.external, "external"), (g.dynamic, "dynamic"), (g.volatile, "volatile"), (g.spill, "spill")] {
+            for (on, name) in [(g.external, "external"), (g.dynamic, "dynamic"), (g.volatile, "volatile"), (g.spill, "spill"), (g.covered > 0, "reads_merged_blank")] {
                 if on {
                     flags.push(name);
                 }
@@ -94,6 +94,34 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
                 link_a1(wb, a, &id, &a1, "writes", &mut edges);
             }
         }
+        // Dropdowns pick from a range; validation and conditional formats read their formula's refs.
+        let (mut ndv, mut ncf) = (0, 0);
+        for r in &sa.rules {
+            let (id, ty) = if r.kind == "cond_format" {
+                ncf += 1;
+                (format!("s{}.cf{ncf}", si + 1), "cond_format")
+            } else {
+                ndv += 1;
+                (format!("s{}.dv{ndv}", si + 1), "validation")
+            };
+            nodes.push(json!({
+                "id": id, "type": ty, "kind": r.kind, "sheet": format!("s{}", si + 1),
+                "ranges": r.ranges.iter().map(|x| x.a1()).collect::<Vec<_>>(), "rule": r.desc,
+            }));
+            let kind = if r.kind == "dropdown" { "choices" } else { "reads" };
+            for x in &r.refs {
+                let Some(t) = x.sheet else { continue };
+                let range = format!("{}!{}", quote_sheet(&wb.sheets[t].name), x.rect);
+                let ts = targets(a, t, &x.rect, None);
+                if ts.is_empty() || ts.len() > MAX_TARGETS {
+                    edges.push(json!({"from": id, "to": format!("s{}", t + 1), "kind": kind, "range": range, "via": x.via_name}));
+                } else {
+                    for to in ts {
+                        edges.push(json!({"from": id, "to": to, "kind": kind, "range": range, "via": x.via_name}));
+                    }
+                }
+            }
+        }
         for p in &sh.pivots {
             let id = format!("s{}.pivot{}", si + 1, crate::a1::cell_name(p.anchor.0, p.anchor.1));
             nodes.push(json!({"id": id, "type": "pivot", "sheet": format!("s{}", si + 1), "rows": p.rows, "cols": p.cols, "values": p.values}));
@@ -108,7 +136,25 @@ pub fn build(wb: &Workbook, a: &Analysis) -> J {
         edges.push(json!({"from": group_id(e.sheet, e.group), "to": id, "kind": "imports", "range": e.range}));
     }
     for n in &wb.named_ranges {
-        nodes.push(json!({"id": format!("name:{}", n.name), "type": "named_range", "range": n.range}));
+        // A sheet-local name is `name:Sheet!Name`: other sheets can hold their own.
+        let id = match &n.scope {
+            Some(sc) => format!("name:{sc}!{}", n.name),
+            None => format!("name:{}", n.name),
+        };
+        let scope = n.scope.as_deref().and_then(|x| crate::analyze::sheet_index(wb, x));
+        let def = a.name(scope, &n.name).filter(|d| d.scope == scope);
+        nodes.push(json!({
+            "id": id, "type": "named_range", "range": n.range, "scope": n.scope,
+            "formula": def.is_some_and(|d| d.formula), "lambda": def.is_some_and(|d| d.lambda),
+        }));
+        // What a formula name (or LAMBDA) reads.
+        for (t, r) in def.filter(|d| d.formula).map(|d| d.targets.as_slice()).unwrap_or_default() {
+            let Some(t) = t.or(scope) else { continue };
+            let range = format!("{}!{r}", quote_sheet(&wb.sheets[t].name));
+            for to in targets(a, t, r, None).into_iter().take(MAX_TARGETS) {
+                edges.push(json!({"from": id, "to": to, "kind": "reads", "range": range}));
+            }
+        }
     }
     for p in &a.macros {
         let id = macro_id(wb, p);

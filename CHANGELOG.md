@@ -32,6 +32,20 @@ All notable changes to this project are documented here. The format follows
   inputs left editable under protection.
 - Numbers in xlsx/xlsm show as their format displays them (`25%`, `$12.50`, `(1,234)`), not only dates.
 - `tests/fixtures/audit.xlsx` and `tests/audit.rs`: one workbook with every item on the coverage checklist.
+- Very hidden sheets (only macro code can unhide them) are marked as such (`Sheet.very_hidden`).
+- Names local to one sheet keep their scope (`NamedRange.scope`), and a sheet's own definition wins over a
+  workbook-wide name of the same name. Names defined by a formula, LAMBDA functions included, link to what the
+  formula reads, through other names too.
+- Named cell styles ("Input", "Calculation", custom ones) as `Style.cell_style`, and which sides of a cell have a
+  border and its line (`Style.border`: `bottom double`, `box thin`), from Excel and Google.
+- Dropdowns, validation formulas and conditional formats are graph nodes with `choices` / `reads` edges to the ranges
+  they read; REPORT.md lists those that read another sheet, and `trace` shows them both ways.
+- `trace` follows links into other workbooks extracted to the same folder (`'[Other.xlsx]Data'!A1`, IMPORTRANGE),
+  in both directions.
+- Merged cells: `cells` and `trace` say a cell is merged or hidden under a merge and show what the merge displays;
+  REPORT.md folds repeating merges (`12× A:C, 1 row each, rows 8–30`); formulas reading a cell hidden under a merge
+  (always blank) are flagged.
+- Google Sheets slicers (as filters) and Tables.
 
 ### Fixed
 
@@ -42,6 +56,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `Style.borders` (has any border) is replaced by `Style.border`, which says which sides and their line.
 - REPORT.md counts modules with no code (the empty module Excel gives every sheet) instead of listing each one.
 
 ## [0.1.0]

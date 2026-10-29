@@ -63,6 +63,7 @@ pub fn read_limited(path: &Path, budget: u64) -> Result<Workbook> {
             name: name.clone(),
             index,
             hidden: meta.visible != SheetVisible::Visible,
+            very_hidden: meta.visible == SheetVisible::VeryHidden,
             kind: "GRID".into(),
             cells,
             elided,
@@ -76,7 +77,7 @@ pub fn read_limited(path: &Path, budget: u64) -> Result<Workbook> {
     }
     // _FilterDatabase is the hidden name Excel keeps for every autofilter.
     for (name, formula) in book.defined_names().iter().filter(|(n, _)| !n.ends_with("_FilterDatabase")) {
-        wb.named_ranges.push(NamedRange { name: name.clone(), range: formula.trim_start_matches('=').to_string() });
+        wb.named_ranges.push(NamedRange { name: name.clone(), range: formula.trim_start_matches('=').to_string(), scope: None });
     }
     // calamine panics on some VBA compression it doesn't expect; lose the
     // macros then, not the workbook.

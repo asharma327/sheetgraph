@@ -1,6 +1,7 @@
 """Build tests/fixtures/audit.xlsx: one workbook holding every item on the
 coverage checklist (file-level metadata, tabs, cells, dependencies), so
-sheetgraph's output can be checked item by item in tests/audit.rs.
+sheetgraph's output can be checked item by item in tests/audit.rs. Also
+builds tests/fixtures/Other.xlsx, the workbook audit.xlsx links to.
 
 openpyxl writes most of it. Images (floating and in a cell), a linked data
 type, shapes, a form button, data connections, a Power Query and sparklines are
@@ -34,6 +35,7 @@ from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 OUT = Path(__file__).with_name("audit.xlsx")
+OTHER = Path(__file__).with_name("Other.xlsx")
 thin = Side(style="thin")
 
 
@@ -91,11 +93,13 @@ def build() -> bytes:
         inp.cell(r, 11, v)  # K2:K4
     dv1 = DataValidation(type="list", formula1='"Yes,No"', allow_blank=True)
     dv2 = DataValidation(type="list", formula1="=$K$2:$K$4")
-    inp.add_data_validation(dv1)
-    inp.add_data_validation(dv2)
-    dv1.add("I2")
-    dv2.add("I3")
-    inp["I2"], inp["I3"] = "Yes", "Mid"
+    dv3 = DataValidation(type="list", formula1="=Lookup!$A$1:$A$2")  # choices on another sheet
+    dv4 = DataValidation(type="list", formula1="=Choices")  # choices through a name
+    dv5 = DataValidation(type="custom", formula1="=I6<=Report!$B$2")  # a formula reading another sheet
+    for dv, cell in [(dv1, "I2"), (dv2, "I3"), (dv3, "I4"), (dv4, "I5"), (dv5, "I6")]:
+        inp.add_data_validation(dv)
+        dv.add(cell)
+    inp["I2"], inp["I3"], inp["I4"], inp["I5"], inp["I6"] = "Yes", "Mid", "a", "Low", 5
     inp["J2"] = 100
     inp["J2"].style = "Input"
     inp["L2"] = 5
@@ -110,6 +114,8 @@ def build() -> bytes:
     inp["N2"].border = Border(left=thin, right=thin, top=thin, bottom=thin)
     inp["N3"] = "underlined cell"
     inp["N3"].border = Border(bottom=Side(style="double"))
+    inp["N4"] = "total line"
+    inp["N4"].border = Border(top=thin, bottom=Side(style="double"))
     inp["Z1"] = 1
 
     # ---------------- Report: table, chart, filter, freeze, tab colour, protection
@@ -150,6 +156,8 @@ def build() -> bytes:
     calc["B4"] = "='[Other.xlsx]Data'!A1"
     calc["B5"] = "=1/0"
     calc["B6"] = '=VLOOKUP("a",Lookup!A1:B3,2,FALSE)'
+    calc["B7"] = "=Inputs!B8"  # inside the merge A8:C8: always blank
+    calc["B8"] = "=GrossRate*2"
     calc.conditional_formatting.add("A1:A8", FormulaRule(formula=["Inputs!$B$2>10"], fill=PatternFill("solid", bgColor="FFC7CE")))
 
     look = wb.create_sheet("Lookup")
@@ -171,6 +179,19 @@ def build() -> bytes:
         obj.row_dimensions[r].outlineLevel = 1
     obj.sheet_view.showGridLines = False
 
+    # ---------------- Layout: repeating merges (period headers across, labels down)
+    lay = wb.create_sheet("Layout")
+    for i, month in enumerate(["Jan", "Feb", "Mar", "Apr"]):
+        c = 2 + 3 * i
+        lay.cell(1, c, month)
+        lay.merge_cells(start_row=1, start_column=c, end_row=1, end_column=c + 2)
+    for i, region in enumerate(["North", "South", "East"]):
+        r = 2 + 2 * i
+        lay.cell(r, 1, region)
+        lay.merge_cells(start_row=r, start_column=1, end_row=r + 1, end_column=1)
+    lay["O1"] = "Notes"
+    lay.merge_cells("O1:P2")
+
     cs = wb.create_chartsheet("ChartSheet")
     ch2 = BarChart()
     ch2.title = "Calc values"
@@ -180,6 +201,10 @@ def build() -> bytes:
     wb.defined_names["TaxRate"] = DefinedName("TaxRate", attr_text="Inputs!$B$3")
     wb.defined_names["AddTax"] = DefinedName("AddTax", attr_text="_xlfn.LAMBDA(_xlpm.x,_xlpm.x*(1+TaxRate))")
     calc.defined_names["LocalRate"] = DefinedName("LocalRate", attr_text="Calc!$A$1")
+    # Same name workbook-wide: Calc's own definition wins on Calc.
+    wb.defined_names["LocalRate"] = DefinedName("LocalRate", attr_text="Inputs!$B$4")
+    wb.defined_names["GrossRate"] = DefinedName("GrossRate", attr_text="TaxRate+0.05")
+    wb.defined_names["Choices"] = DefinedName("Choices", attr_text="Inputs!$K$2:$K$4")
 
     out = BytesIO()
     wb.save(out)
@@ -346,6 +371,19 @@ def add_parts(xlsx: bytes) -> bytes:
     return out.getvalue()
 
 
+def other() -> bytes:
+    """The workbook audit.xlsx's Calc!B4 reads ('[Other.xlsx]Data'!A1)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    ws["A1"] = "=B1*2"
+    ws["B1"] = 21
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 if __name__ == "__main__":
     OUT.write_bytes(add_parts(build()))
-    print(f"wrote {OUT}")
+    OTHER.write_bytes(other())
+    print(f"wrote {OUT} and {OTHER}")

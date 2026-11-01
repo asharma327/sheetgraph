@@ -14,9 +14,13 @@ use crate::model::Workbook;
 use crate::report::approx_tokens;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use crate::query::Book;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Meta {
@@ -185,4 +189,55 @@ pub fn write_index(out: &Path) -> Result<String> {
     }
     fs::write(out.join("INDEX.md"), &s)?;
     Ok(s)
+}
+
+/// The other workbooks extracted into the same output folder as `dir`, for
+/// `trace` to follow links into. Each is loaded the first time it's needed.
+pub struct Siblings {
+    metas: Vec<(PathBuf, Meta)>,
+    cache: RefCell<HashMap<PathBuf, Option<Book>>>,
+}
+
+impl Siblings {
+    pub fn of(dir: &Path) -> Siblings {
+        let me = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let mut metas = Vec::new();
+        if let Some(Ok(entries)) = me.parent().map(fs::read_dir) {
+            for p in entries.flatten().map(|e| e.path()).filter(|p| *p != me) {
+                if let Some(m) = fs::read(p.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<Meta>(&b).ok()) {
+                    metas.push((p, m));
+                }
+            }
+        }
+        Siblings { metas, cache: RefCell::new(HashMap::new()) }
+    }
+
+    fn open(&self, dir: &Path) -> Option<Book> {
+        self.cache
+            .borrow_mut()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                let wb = load(dir).ok()?;
+                let a = crate::analyze::analyze(&wb);
+                Some(Rc::new((wb, a)))
+            })
+            .clone()
+    }
+}
+
+impl crate::query::Linked for Siblings {
+    fn book(&self, target: &str) -> Option<Book> {
+        let file = |id: &str| Path::new(id).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(target));
+        let (dir, _) = self.metas.iter().find(|(_, m)| m.id == target || file(&m.id))?;
+        self.open(dir)
+    }
+
+    fn importers(&self, wb: &Workbook) -> Vec<Book> {
+        let me = crate::query::link_name(wb);
+        self.metas
+            .iter()
+            .filter(|(_, m)| m.imports.iter().any(|t| *t == wb.source.id || t.eq_ignore_ascii_case(&me)))
+            .filter_map(|(dir, _)| self.open(dir))
+            .collect()
+    }
 }

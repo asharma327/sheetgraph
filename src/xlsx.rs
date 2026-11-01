@@ -63,6 +63,7 @@ pub fn read_limited(path: &Path, budget: u64) -> Result<Workbook> {
             name: name.clone(),
             index,
             hidden: meta.visible != SheetVisible::Visible,
+            very_hidden: meta.visible == SheetVisible::VeryHidden,
             kind: "GRID".into(),
             cells,
             elided,
@@ -76,14 +77,23 @@ pub fn read_limited(path: &Path, budget: u64) -> Result<Workbook> {
     }
     // _FilterDatabase is the hidden name Excel keeps for every autofilter.
     for (name, formula) in book.defined_names().iter().filter(|(n, _)| !n.ends_with("_FilterDatabase")) {
-        wb.named_ranges.push(NamedRange { name: name.clone(), range: formula.trim_start_matches('=').to_string() });
+        wb.named_ranges.push(NamedRange { name: name.clone(), range: formula.trim_start_matches('=').to_string(), scope: None });
     }
-    if let Ok(Some(vba)) = book.vba_project() {
-        for m in vba.get_module_names() {
-            if let Ok(src) = vba.get_module(m) {
-                wb.scripts.push(Script { kind: "vba".into(), name: m.to_string(), source: src });
-            }
-        }
+    // calamine panics on some VBA compression it doesn't expect; lose the
+    // macros then, not the workbook.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let vba = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Vec<Script> {
+        let Ok(Some(vba)) = book.vba_project() else { return Vec::new() };
+        vba.get_module_names()
+            .into_iter()
+            .filter_map(|m| Some(Script { kind: "vba".into(), name: m.to_string(), source: vba.get_module(m).ok()? }))
+            .collect()
+    }));
+    std::panic::set_hook(hook);
+    match vba {
+        Ok(scripts) => wb.scripts.extend(scripts),
+        Err(_) => wb.warnings.push("VBA macros could not be decoded (unsupported compression); their code is missing".into()),
     }
     if matches!(ext.as_str(), "xlsx" | "xlsm" | "xltx" | "xltm") {
         if let Err(e) = crate::ooxml::enrich(path, &mut wb) {

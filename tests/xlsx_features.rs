@@ -23,7 +23,7 @@ fn styles_and_number_formats() {
     let wb = load();
     let data = sheet(&wb, "Data");
     let header = &wb.styles[at(data, "A1").s.expect("header styled") as usize];
-    assert!(header.bold && header.borders && header.wrap);
+    assert!(header.bold && header.border.is_some() && header.wrap);
     assert_eq!(header.fg.as_deref(), Some("#FFFFFF"));
     assert_eq!(header.bg.as_deref(), Some("#376092"), "theme accent1, darker 25%");
     assert_eq!(header.h_align.as_deref(), Some("CENTER"));

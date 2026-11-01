@@ -24,6 +24,22 @@ pub struct Workbook {
     /// name them as `'[file]Sheet'!A1`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_links: Vec<ExternalLink>,
+    /// Document properties: title, author, description, … then custom ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<(String, String)>,
+    /// Calculation settings, when not the default (automatic, no iteration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calc: Option<Calc>,
+    /// Sheets can't be added, removed, renamed or unhidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structure_locked: bool,
+    /// Data connections: databases, web queries, text imports, Power Query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<Connection>,
+    /// Discussion comments the source doesn't tie to a cell (Google Drive
+    /// comments). Excel comments are cell notes ([`Cell::note`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
     /// Anything the backend could not extract, so consumers know what is missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -54,6 +70,9 @@ pub struct Sheet {
     pub index: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub hidden: bool,
+    /// Hidden so that only macro code can unhide it (Excel `veryHidden`); also `hidden`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub very_hidden: bool,
     /// GRID, OBJECT (chart sheet), DATA_SOURCE
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
@@ -66,6 +85,10 @@ pub struct Sheet {
     pub frozen_cols: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_color: Option<String>,
+    /// The sheet's VBA code name (`Sheet1`), which macros can use in place of
+    /// `Worksheets("Data")` and which names the sheet's own code module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_name: Option<String>,
     /// Sparse, sorted by (row, col).
     pub cells: Vec<Cell>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -86,9 +109,24 @@ pub struct Sheet {
     pub hidden_cols: Vec<(u32, u32)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banded: Vec<Rect>,
+    /// Columns not at the sheet's default width: (first, last, pixels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub col_widths: Vec<(u32, u32, u32)>,
+    /// Rows not at the default height: (first, last, pixels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_heights: Vec<(u32, u32, u32)>,
+    /// Gridlines turned off: laid out as a page or form rather than a grid.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_gridlines: bool,
+    /// Grouped rows and columns, which can be collapsed to their summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outlines: Vec<Outline>,
     /// Excel tables (ListObjects); formulas reach them as `Name[Column]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<Table>,
+    /// Pictures, shapes, text boxes and form controls placed over the grid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<Shape>,
     /// Rows summarized instead of kept, when the workbook was too big to hold
     /// whole (see [`crate::xlsx::CELL_BUDGET`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,23 +216,70 @@ pub struct Cell {
     pub s: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dv: Option<u32>,
+    /// Note or comment thread, each message as `Author: text` when the
+    /// author is known, replies after `\n↳ `.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// Text whose formatting changes partway (one word bold, say), as runs.
+    /// Only kept when the runs differ from each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Run>,
+    /// A picture in the cell, or a data type (stock, place, person chip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obj: Option<CellObject>,
 }
 
 impl Cell {
     pub fn is_blank(&self) -> bool {
-        self.v.is_empty() && self.f.is_none()
+        self.v.is_empty() && self.f.is_none() && self.obj.is_none()
     }
     /// What a person would see in the cell.
     pub fn display(&self) -> String {
-        match &self.t {
-            Some(t) => t.clone(),
-            None => self.v.to_string(),
+        match (&self.t, &self.obj) {
+            (Some(t), _) => t.clone(),
+            (None, Some(o)) if self.v.is_empty() => match &o.text {
+                Some(t) => format!("[{}: {t}]", o.kind),
+                None => format!("[{}]", o.kind),
+            },
+            _ => self.v.to_string(),
         }
     }
+}
+
+/// A stretch of a cell's text with its own formatting (only the font
+/// properties of [`Style`] are used).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Run {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Style::is_plain")]
+    pub f: Style,
+}
+
+/// Whether runs differ in emphasis (bold, italic, underline, strike, colour).
+/// Runs that only switch font or size are mostly font fallback for another
+/// script, and aren't worth keeping.
+pub fn runs_differ(runs: &[Run]) -> bool {
+    let key = |r: &Run| (r.f.bold, r.f.italic, r.f.underline, r.f.strike, r.f.fg.clone());
+    runs.iter().any(|r| key(r) != key(&runs[0]))
+}
+
+/// What a cell holds besides a plain value.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CellObject {
+    /// "image" (a picture in the cell), "entity" (Excel linked data type such
+    /// as Stocks or Geography), "person", "file", "link" (Google smart chips).
+    pub kind: String,
+    /// Alt text of a picture, or the data type's display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Picture file inside the package, or a chip's URL / email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// A data type's fields (`Price = 412.5`, `Population = 67750000`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -255,8 +340,10 @@ pub struct Style {
     pub strike: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub underline: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub borders: bool,
+    /// Which sides have a border and its line: `box thin`, `bottom double`,
+    /// `top thin, bottom double`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h_align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,9 +352,41 @@ pub struct Style {
     pub size: Option<u32>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub wrap: bool,
+    /// Left editable when the sheet is protected (cells are locked by default).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unlocked: bool,
+    /// The formula is hidden from the formula bar when the sheet is protected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden_formula: bool,
+    /// Named cell style other than Normal ("Input", "Calculation", "Good", a custom one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_style: Option<String>,
+}
+
+/// `box thin` when all four sides share a line, else the sides grouped by
+/// line: `top thin, bottom double`. None without any side.
+pub fn border_desc(sides: &[(&str, String)]) -> Option<String> {
+    if sides.is_empty() {
+        return None;
+    }
+    if sides.len() == 4 && sides.iter().all(|(_, l)| *l == sides[0].1) {
+        return Some(format!("box {}", sides[0].1));
+    }
+    let mut groups: Vec<(Vec<&str>, &str)> = Vec::new();
+    for (side, line) in sides {
+        match groups.iter_mut().find(|(_, l)| l == line) {
+            Some(g) => g.0.push(side),
+            None => groups.push((vec![side], line)),
+        }
+    }
+    Some(groups.iter().map(|(s, l)| format!("{} {l}", s.join("+"))).collect::<Vec<_>>().join(", "))
 }
 
 impl Style {
+    pub fn is_plain(&self) -> bool {
+        *self == Style::default()
+    }
+
     pub fn is_date(&self) -> bool {
         matches!(self.num_type.as_deref(), Some("DATE" | "DATE_TIME" | "TIME"))
     }
@@ -290,8 +409,12 @@ pub struct Validation {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NamedRange {
     pub name: String,
-    /// A1 reference including sheet, e.g. `'Revenue Input'!A1:R100`.
+    /// A1 reference including sheet, e.g. `'Revenue Input'!A1:R100`, or the
+    /// formula a name stands for (a constant, an expression, a LAMBDA).
     pub range: String,
+    /// The sheet a name is local to; None for workbook-wide names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -299,6 +422,10 @@ pub struct CondFormat {
     pub ranges: Vec<Rect>,
     /// Human-readable rule, e.g. `NUMBER_LESS 0 → fg#FF0000` or `=$C2>100 → bg#F4CCCC`.
     pub rule: String,
+    /// Formulas the rule evaluates, each with a leading `=`, relative to the
+    /// top-left cell of the first range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formulas: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -365,12 +492,159 @@ pub struct ExternalLink {
     pub sheets: Vec<String>,
 }
 
+/// How the workbook recalculates.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Calc {
+    /// "automatic", "manual", "automatic except tables" (Excel); "on change",
+    /// "on change and every minute", "on change and every hour" (Google).
+    pub mode: String,
+    /// Circular references are allowed and iterated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub iterative: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_change: Option<f64>,
+}
+
+/// A run of grouped rows or columns (an outline level).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Outline {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cols: bool,
+    /// First and last row (or column), 0-based and inclusive.
+    pub span: (u32, u32),
+    /// 1 for an outer group, 2 for one inside it, …
+    pub depth: u32,
+    /// Collapsed: the group's rows or columns are hidden.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub collapsed: bool,
+}
+
+/// Grouped spans from outline levels: `levels` holds (first, last, level)
+/// with level > 0, sorted. A group is collapsed when `hidden` covers all of it.
+pub fn outlines(levels: &[(u32, u32, u32)], hidden: &[(u32, u32)], cols: bool) -> Vec<Outline> {
+    let mut hidden = hidden.to_vec();
+    hidden.sort_unstable();
+    let covered = |(a, b): (u32, u32)| {
+        let mut next = a;
+        for h in hidden.iter().filter(|h| h.1 >= a && h.0 <= b) {
+            if h.0 > next {
+                return false;
+            }
+            next = next.max(h.1.saturating_add(1));
+        }
+        next > b
+    };
+    let max = levels.iter().map(|l| l.2).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for depth in 1..=max {
+        let mut run: Option<(u32, u32)> = None;
+        let mut flush = |run: Option<(u32, u32)>| {
+            if let Some(span) = run {
+                out.push(Outline { cols, span, depth, collapsed: covered(span) });
+            }
+        };
+        for &(a, b, _) in levels.iter().filter(|l| l.2 >= depth) {
+            run = match run {
+                Some((s, e)) if e + 1 == a => Some((s, b)),
+                prev => {
+                    flush(prev);
+                    Some((a, b))
+                }
+            };
+        }
+        flush(run);
+    }
+    out.sort_by_key(|o| (o.span.0, o.depth));
+    out
+}
+
+/// Add index `i` with value `v` to (first, last, value) spans built in order.
+pub fn push_sized(spans: &mut Vec<(u32, u32, u32)>, i: u32, v: u32) {
+    match spans.last_mut() {
+        Some(last) if last.1 + 1 == i && last.2 == v => last.1 = i,
+        _ => spans.push((i, i, v)),
+    }
+}
+
+/// A comment thread on the file (see [`Workbook::comments`]).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Comment {
+    pub author: String,
+    pub text: String,
+    /// What the commented cell showed when the comment was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<String>,
+    /// The cell (`Sheet!A1`) that shows `quoted`, when exactly one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resolved: bool,
+    /// (author, text) of each reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<(String, String)>,
+}
+
+/// A data connection the workbook refreshes from.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Connection {
+    pub name: String,
+    /// "odbc", "oledb", "web", "text", "power query", …
+    pub kind: String,
+    /// Connection string or URL, with passwords removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// SQL, table name or query run on the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub refresh_on_open: bool,
+}
+
+/// Something drawn over the grid.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Shape {
+    /// "picture", "shape", "text box", "button", "checkbox", "dropdown", …
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Cells it covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Rect>,
+    /// Text shown on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Alt text (descriptions of pictures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    /// Macro run when it's clicked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_click: Option<String>,
+    /// Cell a form control reads and writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_cell: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Script {
-    /// "vba" | "apps_script" | "macro"
+    /// "vba" | "apps_script" | "power_query"
     pub kind: String,
     pub name: String,
     pub source: String,
+}
+
+impl Script {
+    /// Whether the module holds any code. Excel gives every sheet and the
+    /// workbook a module, and most stay `Attribute …` / `Option …` lines only.
+    pub fn has_code(&self) -> bool {
+        self.source.lines().map(str::trim).any(|l| {
+            let lower = l.to_ascii_lowercase();
+            !(l.is_empty() || l.starts_with('\'') || lower.starts_with("attribute ") || lower.starts_with("option ") || lower.starts_with("rem "))
+        })
+    }
 }
 
 fn is_false(b: &bool) -> bool {

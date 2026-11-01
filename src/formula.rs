@@ -127,6 +127,17 @@ pub fn lex(f: &str) -> Lexed {
                     i = lex_ref_after_sheet(f, start, i + 1, Some(word.to_string()), &mut out);
                     continue;
                 }
+                // 3D ref across a run of sheets: `Jan:Dec!B2` (sheet "Jan:Dec").
+                if i < b.len() && b[i] == b':' {
+                    let mut k = i + 1;
+                    while k < b.len() && is_ident(b[k]) {
+                        k += 1;
+                    }
+                    if k > i + 1 && k < b.len() && b[k] == b'!' {
+                        i = lex_ref_after_sheet(f, start, k + 1, Some(f[start..k].to_string()), &mut out);
+                        continue;
+                    }
+                }
                 if i < b.len() && b[i] == b'[' {
                     // Table1[Col]
                     out.names.push(word.to_string());
@@ -433,6 +444,16 @@ mod tests {
         assert_eq!(lx.names, vec!["Rate"]);
         let args = call_args(f, lx.funcs[1].open);
         assert_eq!(args, vec!["\"abc\"", "\"S!A1:B2\""]);
+    }
+
+    #[test]
+    fn three_d_refs() {
+        for f in ["=SUM(Jan:Dec!B2)", "=SUM('Jan:Dec'!B2)"] {
+            let lx = lex(f);
+            assert_eq!(lx.refs.len(), 1, "{f}");
+            assert_eq!(lx.refs[0].sheet.as_deref(), Some("Jan:Dec"), "{f}");
+            assert!(lx.names.is_empty(), "{f}");
+        }
     }
 
     #[test]
